@@ -1,3 +1,4 @@
+import math
 import os
 import urllib.parse
 from asyncio import to_thread
@@ -40,7 +41,7 @@ def _download_file(url: str, dest: str):
         return False, str(e)
 
 
-# ── Upload functions ──────────────────────────────────────────────────────────
+# ── Upload: Gofile ────────────────────────────────────────────────────────────
 def _upload_gofile(path: str, key: str) -> str:
     import requests
     try:
@@ -64,6 +65,7 @@ def _upload_gofile(path: str, key: str) -> str:
         return f"❌ Gofile exception: {e}"
 
 
+# ── Upload: Pixeldrain ────────────────────────────────────────────────────────
 def _upload_pixeldrain(path: str, key: str) -> str:
     import requests
     try:
@@ -82,6 +84,7 @@ def _upload_pixeldrain(path: str, key: str) -> str:
         return f"❌ Pixeldrain exception: {e}"
 
 
+# ── Upload: Buzzheavier ───────────────────────────────────────────────────────
 def _upload_buzzheavier(path: str, key: str) -> str:
     import requests
     try:
@@ -96,53 +99,210 @@ def _upload_buzzheavier(path: str, key: str) -> str:
             )
         if r.status_code == 200:
             d = r.json().get("data", {})
-            return d.get("url") or f"https://buzzheavier.com/f/{d.get('id','?')}"
+            return d.get("url") or f"https://buzzheavier.com/f/{d.get('id', '?')}"
         return f"❌ Buzzheavier error: {r.text[:200]}"
     except Exception as e:
         return f"❌ Buzzheavier exception: {e}"
 
 
-def _upload_generic(path: str, endpoint: str, key: str) -> str:
+# ── Upload: Filemirage (chunk API) ────────────────────────────────────────────
+def _upload_filemirage(path: str, key: str) -> str:
+    """
+    Filemirage API:
+      1. GET https://filemirage.com/api/servers  → { data: { server, upload_id } }
+      2. POST <server>/upload.php  (chunk by 100 MB, multipart)
+         fields: filename, upload_id, chunk_number (0-based), total_chunks, file
+         header: Authorization: Bearer <token>
+    """
+    import requests
+
+    CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB per chunk
+
+    headers = {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    try:
+        # Step 1 — get upload server
+        srv_r = requests.get(
+            "https://filemirage.com/api/servers",
+            headers=headers,
+            timeout=30,
+        )
+        srv_j = srv_r.json()
+        if not srv_j.get("success"):
+            return f"❌ Filemirage: gagal dapat server — {srv_j.get('message', srv_r.text[:200])}"
+
+        server    = srv_j["data"]["server"].rstrip("/")
+        upload_id = srv_j["data"]["upload_id"]
+        filename  = os.path.basename(path)
+        file_size = os.path.getsize(path)
+        total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
+        upload_url = f"{server}/upload.php"
+
+        # Step 2 — upload chunk(s)
+        last_rj = {}
+        with open(path, "rb") as fh:
+            for i in range(total_chunks):
+                chunk_data = fh.read(CHUNK_SIZE)
+                up_r = requests.post(
+                    upload_url,
+                    headers=headers,
+                    files={"file": (filename, chunk_data, "application/octet-stream")},
+                    data={
+                        "filename":     filename,
+                        "upload_id":    upload_id,
+                        "chunk_number": i,
+                        "total_chunks": total_chunks,
+                    },
+                    timeout=600,
+                )
+                try:
+                    last_rj = up_r.json()
+                except Exception:
+                    return f"❌ Filemirage: response bukan JSON — {up_r.text[:300]}"
+
+                if not last_rj.get("success"):
+                    return f"❌ Filemirage chunk {i} gagal: {last_rj.get('message', up_r.text[:200])}"
+
+        return last_rj.get("data", {}).get("url") or "❌ Filemirage: URL tidak ditemukan di response"
+
+    except Exception as e:
+        return f"❌ Filemirage exception: {e}"
+
+
+# ── Upload: Transfer.it (web scraping — login email:password) ─────────────────
+def _upload_transferit(path: str, key: str) -> str:
+    """
+    Transfer.it tidak punya API resmi.
+    Gunakan /settransferit email:password untuk login.
+    """
+    import requests
+
+    if not key or ":" not in key:
+        return "❌ Transfer.it butuh email:password. Gunakan /settransferit email@kamu.com:passwordkamu"
+
+    email, password = key.split(":", 1)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    })
+
+    try:
+        # Step 1 — ambil CSRF token
+        home = session.get("https://transfer.it/", timeout=30)
+        csrf = ""
+        for line in home.text.splitlines():
+            if 'csrf' in line.lower() and 'content' in line.lower():
+                import re
+                m = re.search(r'content=["\']([^"\']+)["\']', line)
+                if m:
+                    csrf = m.group(1)
+                    break
+
+        # Step 2 — login
+        login_r = session.post(
+            "https://transfer.it/login",
+            json={"email": email, "password": password, "_token": csrf},
+            headers={"X-CSRF-TOKEN": csrf, "Referer": "https://transfer.it/"},
+            timeout=30,
+        )
+        if login_r.status_code not in (200, 302) or "logout" not in login_r.text.lower():
+            # coba form login biasa
+            login_r = session.post(
+                "https://transfer.it/login",
+                data={"email": email, "password": password, "_token": csrf},
+                headers={"Referer": "https://transfer.it/login"},
+                timeout=30,
+                allow_redirects=True,
+            )
+
+        # Step 3 — upload
+        filename = os.path.basename(path)
+        with open(path, "rb") as f:
+            up_r = session.post(
+                "https://transfer.it/upload",
+                files={"file": (filename, f)},
+                timeout=600,
+            )
+
+        try:
+            rj = up_r.json()
+            return rj.get("url") or rj.get("link") or str(rj)
+        except Exception:
+            # cari link di HTML response
+            import re
+            m = re.search(r'https://transfer\.it/\S+', up_r.text)
+            if m:
+                return m.group(0)
+            return f"❌ Transfer.it: tidak bisa parse response — {up_r.text[:300]}"
+
+    except Exception as e:
+        return f"❌ Transfer.it exception: {e}"
+
+
+# ── Upload: Player4me ─────────────────────────────────────────────────────────
+def _upload_player4me(path: str, key: str) -> str:
     import requests
     try:
         with open(path, "rb") as f:
             r = requests.post(
-                endpoint,
+                "https://player4me.com/api/upload",
                 files={"file": (os.path.basename(path), f)},
                 data={"api_key": key},
                 timeout=600,
             )
         rj = r.json()
         if r.status_code == 200:
-            return (
-                rj.get("data", {}).get("url")
-                or rj.get("url")
-                or rj.get("link")
-                or str(rj)
-            )
-        return f"❌ HTTP {r.status_code}: {r.text[:200]}"
+            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
+        return f"❌ Player4me error: {r.text[:200]}"
     except Exception as e:
-        return f"❌ Exception: {e}"
+        return f"❌ Player4me exception: {e}"
 
 
-_ENDPOINTS = {
-    "player4me":  "https://player4me.com/api/upload",
-    "akirabox":   "https://akirabox.com/api/upload",
-    "filemirage": "https://filemirage.com/api/upload",
-    "transferit": "https://transfer.it/api/upload",
+# ── Upload: Akirabox ──────────────────────────────────────────────────────────
+def _upload_akirabox(path: str, key: str) -> str:
+    import requests
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                "https://akirabox.com/api/upload",
+                files={"file": (os.path.basename(path), f)},
+                data={"api_key": key},
+                timeout=600,
+            )
+        rj = r.json()
+        if r.status_code == 200:
+            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
+        return f"❌ Akirabox error: {r.text[:200]}"
+    except Exception as e:
+        return f"❌ Akirabox exception: {e}"
+
+
+# ── Routing table ─────────────────────────────────────────────────────────────
+_UPLOAD_FUNCS = {
+    "gofile":      _upload_gofile,
+    "pixeldrain":  _upload_pixeldrain,
+    "buzzheavier": _upload_buzzheavier,
+    "filemirage":  _upload_filemirage,
+    "transferit":  _upload_transferit,
+    "player4me":   _upload_player4me,
+    "akirabox":    _upload_akirabox,
 }
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 @new_task
 async def set_api_key_cmd(_, message):
     parts = message.text.strip().split(maxsplit=1)
     host  = parts[0].lstrip("/").lower().replace("set", "", 1)
     if len(parts) < 2:
-        await message.reply(f"Gunakan: <code>/set{host} API_KEY_ANDA</code>")
+        hint = "email:password" if host == "transferit" else "API_KEY_ANDA"
+        await message.reply(f"Gunakan: <code>/set{host} {hint}</code>")
         return
     _API_KEYS[host] = parts[1].strip()
-    await message.reply(f"✅ API Key <b>{host}</b> berhasil disimpan!")
+    await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan!")
 
 
 @new_task
@@ -162,7 +322,6 @@ async def multi_mirror_cmd(_, message):
         await message.reply("❌ URL tidak valid, harus diawali https://")
         return
 
-    # Tentukan nama file
     fname = url.split("/")[-1].split("?")[0].strip()
     if not fname or len(fname) < 3:
         fname = "file_download"
@@ -171,30 +330,31 @@ async def multi_mirror_cmd(_, message):
     dest = os.path.join(TEMP_DIR, fname)
 
     # Step 1: Download
-    status_msg = await message.reply(f"⬇️ Mengunduh file dari link…\n<code>{url}</code>")
+    status_msg = await message.reply(
+        f"⬇️ Mengunduh file dari link…\n<code>{url}</code>"
+    )
     ok, err = await to_thread(_download_file, url, dest)
 
     if not ok:
         await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
         return
 
+    size_kb = os.path.getsize(dest) // 1024
+    size_str = f"{size_kb // 1024} MB" if size_kb > 1024 else f"{size_kb} KB"
+
     # Step 2: Upload
-    await status_msg.edit(f"⬆️ File diunduh ({os.path.getsize(dest)//1024} KB). Mengupload ke <b>{host}</b>…")
+    await status_msg.edit(
+        f"⬆️ File diunduh ({size_str}). Mengupload ke <b>{host}</b>…"
+    )
 
-    key = _API_KEYS.get(host, "")
+    key  = _API_KEYS.get(host, "")
+    func = _UPLOAD_FUNCS.get(host)
 
-    if host == "gofile":
-        link = await to_thread(_upload_gofile, dest, key)
-    elif host == "pixeldrain":
-        link = await to_thread(_upload_pixeldrain, dest, key)
-    elif host == "buzzheavier":
-        link = await to_thread(_upload_buzzheavier, dest, key)
-    else:
-        ep = _ENDPOINTS.get(host)
-        if not ep:
-            await status_msg.edit(f"❌ Host tidak dikenal: {host}")
-            return
-        link = await to_thread(_upload_generic, dest, ep, key)
+    if not func:
+        await status_msg.edit(f"❌ Host tidak dikenal: <code>{host}</code>")
+        return
+
+    link = await to_thread(func, dest, key)
 
     # Cleanup
     try:
@@ -207,7 +367,7 @@ async def multi_mirror_cmd(_, message):
     )
 
 
-# ── Register handlers ─────────────────────────────────────────────────────────
+# ── Self-register handlers ────────────────────────────────────────────────────
 TgClient.bot.add_handler(
     MessageHandler(
         set_api_key_cmd,
