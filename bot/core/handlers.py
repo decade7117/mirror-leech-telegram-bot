@@ -2,8 +2,6 @@ from pyrogram.filters import command, regex
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler, EditedMessageHandler
 
 from ..modules import *
-from ..modules import *
-from ..modules import multi_uploader  # ← TAMBAHKAN BARIS INI SAJA
 from ..helper.telegram_helper.bot_commands import BotCommands
 from ..helper.telegram_helper.filters import CustomFilters
 from .telegram_manager import TgClient
@@ -321,23 +319,3 @@ def add_handlers():
             & CustomFilters.authorized,
         )
     )
-# === TAMBAHAN UNTUK MULTI UPLOADER ===
-    from pyrogram.filters import command
-    from bot.modules.multi_uploader import set_api_key_cmd, mirror_file_cmd
-    
-    host_list = ['gofile', 'pixeldrain', 'transferit', 'filemirage', 'buzzheavier', 'player4me', 'akirabox']
-    set_host_list = [f"set{host}" for host in host_list]
-    
-    TgClient.bot.add_handler(
-        MessageHandler(
-            set_api_key_cmd,
-            filters=command(set_host_list, case_sensitive=False) & CustomFilters.authorized,
-        )
-    )
-    TgClient.bot.add_handler(
-        MessageHandler(
-            mirror_file_cmd,
-            filters=command(host_list, case_sensitive=False) & CustomFilters.authorized,
-        )
-    )
-    # =====================================
