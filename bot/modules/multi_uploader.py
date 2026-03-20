@@ -10,7 +10,7 @@ from ..core.telegram_manager import TgClient
 from ..helper.ext_utils.bot_utils import new_task
 from ..helper.telegram_helper.filters import CustomFilters
 
-# ── Storage API key per-sesi ──────────────────────────────────────────────────
+# ── In-memory API key store ───────────────────────────────────────────────────
 _API_KEYS: dict = {
     "gofile":      "",
     "pixeldrain":  "",
@@ -23,12 +23,61 @@ _API_KEYS: dict = {
 
 HOST_LIST     = list(_API_KEYS.keys())
 SET_HOST_LIST = [f"set{h}" for h in HOST_LIST]
+TEMP_DIR      = "/tmp/multi_uploader_dl"
 
-TEMP_DIR = "/tmp/multi_uploader_dl"
+# ── MongoDB persistence ───────────────────────────────────────────────────────
+# Simpan/load API keys dari MongoDB agar tidak hilang saat docker rebuild
+
+async def _db_load_keys():
+    """Load API keys dari MongoDB saat bot start."""
+    try:
+        from ..core.config_manager import Config
+        import motor.motor_asyncio
+        client = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
+        db     = client.mltb
+        doc    = await db.multi_uploader_keys.find_one({"_id": "api_keys"})
+        if doc:
+            for host in HOST_LIST:
+                if doc.get(host):
+                    _API_KEYS[host] = doc[host]
+        client.close()
+    except Exception as e:
+        from .. import LOGGER
+        LOGGER.warning(f"multi_uploader: gagal load keys dari DB — {e}")
 
 
+async def _db_save_keys():
+    """Simpan semua API keys ke MongoDB."""
+    try:
+        from ..core.config_manager import Config
+        import motor.motor_asyncio
+        client = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
+        db     = client.mltb
+        await db.multi_uploader_keys.update_one(
+            {"_id": "api_keys"},
+            {"$set": {k: v for k, v in _API_KEYS.items()}},
+            upsert=True,
+        )
+        client.close()
+    except Exception as e:
+        from .. import LOGGER
+        LOGGER.warning(f"multi_uploader: gagal simpan keys ke DB — {e}")
+
+
+# Load keys dari DB saat module pertama kali diimport
+import asyncio as _asyncio
+try:
+    loop = _asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(_db_load_keys())
+    else:
+        loop.run_until_complete(_db_load_keys())
+except Exception:
+    pass
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def _safe_json(r):
-    """Parse JSON safely, return None if response is empty or not JSON."""
     try:
         text = r.text.strip()
         if not text:
@@ -39,7 +88,6 @@ def _safe_json(r):
         return None
 
 
-# ── Download ──────────────────────────────────────────────────────────────────
 def _download_file(url: str, dest: str):
     import requests
     try:
@@ -101,11 +149,8 @@ def _upload_pixeldrain(path: str, key: str) -> str:
 def _upload_buzzheavier(path: str, key: str) -> str:
     import requests
     try:
-        fname = urllib.parse.quote(os.path.basename(path), safe="")
-        headers = {}
-        if key:
-            headers["Authorization"] = f"Bearer {key}"
-
+        fname   = urllib.parse.quote(os.path.basename(path), safe="")
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
         with open(path, "rb") as f:
             r = requests.put(
                 f"https://w.buzzheavier.com/{fname}",
@@ -113,11 +158,10 @@ def _upload_buzzheavier(path: str, key: str) -> str:
                 headers=headers,
                 timeout=600,
             )
-
         rj = _safe_json(r)
         if rj:
             data = rj.get("data", {})
-            url = data.get("url")
+            url  = data.get("url")
             if not url and data.get("id"):
                 url = f"https://buzzheavier.com/{data['id']}"
             if url:
@@ -129,41 +173,16 @@ def _upload_buzzheavier(path: str, key: str) -> str:
 
 # ── Upload: Filemirage ────────────────────────────────────────────────────────
 def _upload_filemirage(path: str, key: str) -> str:
-    """
-    Flow:
-      1. GET https://filemirage.com/api/servers
-         Header: Authorization: Bearer <token>
-         Response: { success: true, data: { server, upload_id } }
-      2. POST <server>/upload.php  per chunk
-         - Intermediate chunks: server returns any response (may have success=false, message="Chunk uploaded")
-         - Final chunk: { success: true, data: { url: "https://..." } }
-
-    NOTE: "Chunk uploaded" in message = chunk diterima server, BUKAN error.
-    Kita skip validasi success untuk intermediate chunks, hanya cek URL di chunk terakhir.
-    """
     import requests
 
-    CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
-
-    headers = {}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
+    CHUNK_SIZE = 100 * 1024 * 1024
+    headers    = {"Authorization": f"Bearer {key}"} if key else {}
 
     try:
-        # Step 1 — get server
-        srv_r = requests.get(
-            "https://filemirage.com/api/servers",
-            headers=headers,
-            timeout=30,
-        )
+        srv_r = requests.get("https://filemirage.com/api/servers", headers=headers, timeout=30)
         srv_j = _safe_json(srv_r)
-        if not srv_j:
-            return (
-                f"❌ Filemirage: response server kosong\n"
-                f"HTTP {srv_r.status_code}: {srv_r.text[:300]}"
-            )
-        if not srv_j.get("success"):
-            return f"❌ Filemirage get server gagal: {srv_j.get('message', str(srv_j)[:200])}"
+        if not srv_j or not srv_j.get("success"):
+            return f"❌ Filemirage get server gagal: {srv_r.text[:300]}"
 
         server       = srv_j["data"]["server"].rstrip("/")
         upload_id    = srv_j["data"]["upload_id"]
@@ -171,14 +190,12 @@ def _upload_filemirage(path: str, key: str) -> str:
         file_size    = os.path.getsize(path)
         total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
         upload_url   = f"{server}/upload.php"
+        last_rj      = {}
 
-        # Step 2 — upload chunks
-        last_rj = {}
         with open(path, "rb") as fh:
             for i in range(total_chunks):
                 chunk_data = fh.read(CHUNK_SIZE)
                 is_last    = (i == total_chunks - 1)
-
                 up_r = requests.post(
                     upload_url,
                     headers=headers,
@@ -191,53 +208,26 @@ def _upload_filemirage(path: str, key: str) -> str:
                     },
                     timeout=600,
                 )
-
-                up_j = _safe_json(up_r)
-
                 if up_r.status_code not in (200, 201):
-                    # HTTP error yang nyata
-                    return (
-                        f"❌ Filemirage chunk {i}: HTTP {up_r.status_code}\n"
-                        f"{up_r.text[:300]}"
-                    )
-
-                if up_j is None:
-                    return f"❌ Filemirage chunk {i}: response kosong\n{up_r.text[:300]}"
-
-                # "Chunk uploaded" = server terima chunk, bukan error
-                # Lanjut ke chunk berikutnya untuk intermediate
+                    return f"❌ Filemirage chunk {i}: HTTP {up_r.status_code}\n{up_r.text[:300]}"
                 if not is_last:
                     continue
+                up_j = _safe_json(up_r)
+                if up_j:
+                    last_rj = up_j
 
-                # Chunk terakhir: ambil URL
-                last_rj = up_j
-
-        # Cek URL dari response chunk terakhir
-        result_url = last_rj.get("data", {}).get("url") if isinstance(last_rj.get("data"), dict) else None
-        if result_url:
-            return result_url
-
-        # Fallback: kalau success=true tapi structure beda
-        if last_rj.get("success") and not result_url:
-            return f"❌ Filemirage: upload OK tapi URL tidak ada — {last_rj}"
-
-        # Kalau success=false tapi ada URL di data
-        if isinstance(last_rj.get("data"), dict) and last_rj["data"].get("url"):
-            return last_rj["data"]["url"]
-
-        return f"❌ Filemirage: response chunk terakhir tidak ada URL — {last_rj}"
-
+        url = last_rj.get("data", {}).get("url") if isinstance(last_rj.get("data"), dict) else None
+        if url:
+            return url
+        return f"❌ Filemirage: selesai tapi tidak ada URL — {last_rj}"
     except Exception as e:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (web scraping - Laravel XSRF cookie) ─────────────────
+# ── Upload: Transfer.it ───────────────────────────────────────────────────────
 def _upload_transferit(path: str, key: str) -> str:
     """
-    Transfer.it = Laravel app.
-    CSRF token bisa diambil dari:
-      - Cookie XSRF-TOKEN (set otomatis oleh Laravel)
-      - Hidden input _token di form
+    Transfer.it = Laravel. Coba 3 strategi login berurutan.
     key format: email:password
     """
     import re
@@ -251,6 +241,7 @@ def _upload_transferit(path: str, key: str) -> str:
         )
 
     email, password = key.split(":", 1)
+
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -258,76 +249,115 @@ def _upload_transferit(path: str, key: str) -> str:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
     })
 
-    def get_csrf(html_text, cookies):
-        """Ambil CSRF token dari HTML atau cookie XSRF-TOKEN."""
-        # 1. Dari cookie XSRF-TOKEN (Laravel standard)
-        xsrf_cookie = cookies.get("XSRF-TOKEN")
-        if xsrf_cookie:
-            return unquote(xsrf_cookie)
-        # 2. Dari hidden input _token
-        m = re.search(
-            r'<input[^>]+name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
-            html_text,
-        )
+    def extract_csrf(html, cookies):
+        # 1. Cookie XSRF-TOKEN (Laravel standard)
+        tok = cookies.get("XSRF-TOKEN")
+        if tok:
+            return unquote(tok)
+        # 2. hidden _token
+        m = re.search(r'name=["\']_token["\'][^>]*value=["\']([^"\']{10,})["\']', html)
         if m:
             return m.group(1)
-        # 3. Dari meta csrf-token
-        m = re.search(
-            r'<meta[^>]+name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']',
-            html_text,
-        )
+        # 3. meta csrf-token
+        m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', html)
+        if m:
+            return m.group(1)
+        # 4. JS window._token atau csrfToken
+        m = re.search(r'["\']?(?:_token|csrfToken)["\']?\s*[:=]\s*["\']([^"\']{10,})["\']', html)
         if m:
             return m.group(1)
         return ""
 
     try:
-        # Step 1 — GET login page (trigger session + set XSRF cookie)
+        # ── Strategi 1: Form-based login ─────────────────────────────────────
         login_page = session.get("https://transfer.it/login", timeout=30)
-        csrf = get_csrf(login_page.text, session.cookies)
+        csrf = extract_csrf(login_page.text, session.cookies)
 
-        if not csrf:
-            return "❌ Transfer.it: tidak bisa ambil CSRF token dari halaman login"
-
-        # Step 2 — POST login
         login_r = session.post(
             "https://transfer.it/login",
-            data={
-                "_token":   csrf,
-                "email":    email,
-                "password": password,
-            },
+            data={"_token": csrf, "email": email, "password": password},
             headers={
-                "Referer":       "https://transfer.it/login",
-                "Content-Type":  "application/x-www-form-urlencoded",
-                "X-CSRF-TOKEN":  csrf,
+                "Referer":      "https://transfer.it/login",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-CSRF-TOKEN": csrf,
+                "Accept":       "text/html,application/xhtml+xml,*/*;q=0.8",
             },
             timeout=30,
             allow_redirects=True,
         )
 
-        # Ambil CSRF baru setelah login (session regenerated)
-        csrf2 = get_csrf(login_r.text, session.cookies)
-        if not csrf2:
-            csrf2 = csrf
+        csrf2 = extract_csrf(login_r.text, session.cookies) or csrf
 
-        # Cek login berhasil
-        is_logged_in = (
+        logged_in = (
             "logout" in login_r.text.lower()
             or "/dashboard" in login_r.url
-            or login_r.url.rstrip("/") == "https://transfer.it"
+            or (login_r.url.rstrip("/") not in (
+                "https://transfer.it/login",
+                "https://transfer.it",
+            ))
         )
-        if not is_logged_in:
-            return (
-                f"❌ Transfer.it: login gagal\n"
-                f"URL setelah login: {login_r.url}\n"
-                f"Cek email/password"
-            )
 
-        # Step 3 — Upload
+        # ── Strategi 2: JSON API login (kalau form gagal) ─────────────────────
+        if not logged_in:
+            session2 = requests.Session()
+            session2.headers.update(session.headers)
+            api_login = session2.post(
+                "https://transfer.it/api/login",
+                json={"email": email, "password": password},
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=30,
+            )
+            aj = _safe_json(api_login)
+            if aj and (aj.get("token") or aj.get("access_token") or aj.get("data")):
+                token = aj.get("token") or aj.get("access_token") or aj.get("data", {}).get("token")
+                # Upload via Bearer token
+                filename = os.path.basename(path)
+                with open(path, "rb") as f:
+                    up_r = session2.post(
+                        "https://transfer.it/api/upload",
+                        files={"file": (filename, f)},
+                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                        timeout=600,
+                    )
+                rj = _safe_json(up_r)
+                if rj:
+                    url = rj.get("url") or rj.get("link") or rj.get("download_url")
+                    if url:
+                        return url
+                return f"❌ Transfer.it API login OK tapi upload gagal: {up_r.text[:300]}"
+
+            # ── Strategi 3: Skip CSRF, langsung POST ─────────────────────────
+            session3 = requests.Session()
+            session3.headers.update(session.headers)
+            session3.get("https://transfer.it/", timeout=30)  # set cookies
+            login3 = session3.post(
+                "https://transfer.it/login",
+                data={"email": email, "password": password},
+                headers={
+                    "Referer": "https://transfer.it/login",
+                    "Accept":  "application/json",
+                },
+                timeout=30,
+                allow_redirects=True,
+            )
+            lj = _safe_json(login3)
+            if lj and lj.get("success"):
+                session = session3
+                csrf2 = extract_csrf(login3.text, session3.cookies) or ""
+                logged_in = True
+            else:
+                # Tampilkan info debug untuk diagnosa
+                return (
+                    f"❌ Transfer.it: semua strategi login gagal\n"
+                    f"URL akhir: {login_r.url}\n"
+                    f"Status: {login_r.status_code}\n"
+                    f"Potongan HTML: {login_r.text[200:400]}"
+                )
+
+        # ── Upload setelah login berhasil ─────────────────────────────────────
         filename = os.path.basename(path)
         with open(path, "rb") as f:
             up_r = session.post(
@@ -349,14 +379,14 @@ def _upload_transferit(path: str, key: str) -> str:
                 return url
             return f"❌ Transfer.it JSON tapi tidak ada URL: {str(rj)[:300]}"
 
-        # Fallback: cari link di HTML
-        m3 = re.search(r'https://transfer\.it/\S+', up_r.text)
-        if m3:
-            return m3.group(0).rstrip('",\'')
+        m = re.search(r'https://transfer\.it/\S+', up_r.text)
+        if m:
+            return m.group(0).rstrip('",\'')
 
         return (
-            f"❌ Transfer.it: tidak bisa parse response\n"
-            f"HTTP {up_r.status_code}\n{up_r.text[:300]}"
+            f"❌ Transfer.it upload gagal\n"
+            f"HTTP {up_r.status_code}\n"
+            f"{up_r.text[:300]}"
         )
 
     except Exception as e:
@@ -376,12 +406,7 @@ def _upload_player4me(path: str, key: str) -> str:
             )
         rj = _safe_json(r)
         if rj and r.status_code == 200:
-            return (
-                rj.get("data", {}).get("url")
-                or rj.get("url")
-                or rj.get("link")
-                or str(rj)
-            )
+            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
         return f"❌ Player4me HTTP {r.status_code}: {r.text[:200]}"
     except Exception as e:
         return f"❌ Player4me exception: {e}"
@@ -400,18 +425,13 @@ def _upload_akirabox(path: str, key: str) -> str:
             )
         rj = _safe_json(r)
         if rj and r.status_code == 200:
-            return (
-                rj.get("data", {}).get("url")
-                or rj.get("url")
-                or rj.get("link")
-                or str(rj)
-            )
+            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
         return f"❌ Akirabox HTTP {r.status_code}: {r.text[:200]}"
     except Exception as e:
         return f"❌ Akirabox exception: {e}"
 
 
-# ── Routing table ─────────────────────────────────────────────────────────────
+# ── Routing ───────────────────────────────────────────────────────────────────
 _UPLOAD_FUNCS = {
     "gofile":      _upload_gofile,
     "pixeldrain":  _upload_pixeldrain,
@@ -433,7 +453,8 @@ async def set_api_key_cmd(_, message):
         await message.reply(f"Gunakan: <code>/set{host} {hint}</code>")
         return
     _API_KEYS[host] = parts[1].strip()
-    await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan!")
+    await _db_save_keys()   # simpan ke MongoDB
+    await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan ke database!")
 
 
 @new_task
@@ -460,11 +481,8 @@ async def multi_mirror_cmd(_, message):
     os.makedirs(TEMP_DIR, exist_ok=True)
     dest = os.path.join(TEMP_DIR, fname)
 
-    # Step 1: Download
-    status_msg = await message.reply(
-        f"⬇️ Mengunduh file dari link…\n<code>{url}</code>"
-    )
-    ok, err = await to_thread(_download_file, url, dest)
+    status_msg = await message.reply(f"⬇️ Mengunduh file…\n<code>{url}</code>")
+    ok, err    = await to_thread(_download_file, url, dest)
 
     if not ok:
         await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
@@ -472,11 +490,7 @@ async def multi_mirror_cmd(_, message):
 
     size_kb  = os.path.getsize(dest) // 1024
     size_str = f"{size_kb // 1024} MB" if size_kb > 1024 else f"{size_kb} KB"
-
-    # Step 2: Upload
-    await status_msg.edit(
-        f"⬆️ File diunduh ({size_str}). Mengupload ke <b>{host}</b>…"
-    )
+    await status_msg.edit(f"⬆️ File diunduh ({size_str}). Mengupload ke <b>{host}</b>…")
 
     key  = _API_KEYS.get(host, "")
     func = _UPLOAD_FUNCS.get(host)
@@ -487,27 +501,18 @@ async def multi_mirror_cmd(_, message):
 
     link = await to_thread(func, dest, key)
 
-    # Cleanup
     try:
         os.remove(dest)
     except Exception:
         pass
 
-    await status_msg.edit(
-        f"✅ <b>Upload ke {host.capitalize()} selesai!</b>\n\n🔗 {link}"
-    )
+    await status_msg.edit(f"✅ <b>Upload ke {host.capitalize()} selesai!</b>\n\n🔗 {link}")
 
 
-# ── Self-register handlers ────────────────────────────────────────────────────
+# ── Register handlers ─────────────────────────────────────────────────────────
 TgClient.bot.add_handler(
-    MessageHandler(
-        set_api_key_cmd,
-        filters=command(SET_HOST_LIST) & CustomFilters.sudo,
-    )
+    MessageHandler(set_api_key_cmd, filters=command(SET_HOST_LIST) & CustomFilters.sudo)
 )
 TgClient.bot.add_handler(
-    MessageHandler(
-        multi_mirror_cmd,
-        filters=command(HOST_LIST) & CustomFilters.authorized,
-    )
+    MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized)
 )
