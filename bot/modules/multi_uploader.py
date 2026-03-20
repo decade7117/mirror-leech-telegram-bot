@@ -27,6 +27,18 @@ SET_HOST_LIST = [f"set{h}" for h in HOST_LIST]
 TEMP_DIR = "/tmp/multi_uploader_dl"
 
 
+def _safe_json(r):
+    """Parse JSON safely, return None if response is empty or not JSON."""
+    try:
+        text = r.text.strip()
+        if not text:
+            return None
+        import json
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 # ── Download ──────────────────────────────────────────────────────────────────
 def _download_file(url: str, dest: str):
     import requests
@@ -57,8 +69,8 @@ def _upload_gofile(path: str, key: str) -> str:
                 data=data,
                 timeout=600,
             )
-        rj = r.json()
-        if r.status_code == 200 and rj.get("status") == "ok":
+        rj = _safe_json(r)
+        if rj and rj.get("status") == "ok":
             return rj["data"]["downloadPage"]
         return f"❌ Gofile error: {r.text[:200]}"
     except Exception as e:
@@ -77,8 +89,9 @@ def _upload_pixeldrain(path: str, key: str) -> str:
                 auth=auth,
                 timeout=600,
             )
-        if r.status_code in (200, 201):
-            return f"https://pixeldrain.com/u/{r.json().get('id')}"
+        rj = _safe_json(r)
+        if rj and rj.get("id"):
+            return f"https://pixeldrain.com/u/{rj['id']}"
         return f"❌ Pixeldrain error: {r.text[:200]}"
     except Exception as e:
         return f"❌ Pixeldrain exception: {e}"
@@ -86,10 +99,18 @@ def _upload_pixeldrain(path: str, key: str) -> str:
 
 # ── Upload: Buzzheavier ───────────────────────────────────────────────────────
 def _upload_buzzheavier(path: str, key: str) -> str:
+    """
+    PUT https://w.buzzheavier.com/<filename>
+    Response: {"code": 201, "data": {"id": "xxxx", ...}}
+    URL hasil: https://buzzheavier.com/<id>
+    """
     import requests
     try:
         fname = urllib.parse.quote(os.path.basename(path), safe="")
-        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        headers = {}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
         with open(path, "rb") as f:
             r = requests.put(
                 f"https://w.buzzheavier.com/{fname}",
@@ -97,48 +118,60 @@ def _upload_buzzheavier(path: str, key: str) -> str:
                 headers=headers,
                 timeout=600,
             )
-        if r.status_code == 200:
-            d = r.json().get("data", {})
-            return d.get("url") or f"https://buzzheavier.com/f/{d.get('id', '?')}"
-        return f"❌ Buzzheavier error: {r.text[:200]}"
+
+        rj = _safe_json(r)
+        if rj:
+            data = rj.get("data", {})
+            # Ada field url langsung atau konstruksi dari id
+            url = data.get("url")
+            if not url and data.get("id"):
+                url = f"https://buzzheavier.com/{data['id']}"
+            if url:
+                return url
+        return f"❌ Buzzheavier HTTP {r.status_code}: {r.text[:300]}"
     except Exception as e:
         return f"❌ Buzzheavier exception: {e}"
 
 
-# ── Upload: Filemirage (chunk API) ────────────────────────────────────────────
+# ── Upload: Filemirage ────────────────────────────────────────────────────────
 def _upload_filemirage(path: str, key: str) -> str:
     """
-    Filemirage API:
-      1. GET https://filemirage.com/api/servers  → { data: { server, upload_id } }
-      2. POST <server>/upload.php  (chunk by 100 MB, multipart)
-         fields: filename, upload_id, chunk_number (0-based), total_chunks, file
-         header: Authorization: Bearer <token>
+    1. GET https://filemirage.com/api/servers
+       Header: Authorization: Bearer <token>
+       Response: { success: true, data: { server: "https://...", upload_id: "..." } }
+    2. POST <server>/upload.php
+       fields: filename, upload_id, chunk_number, total_chunks, file
     """
     import requests
 
-    CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB per chunk
+    CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB
 
     headers = {}
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
     try:
-        # Step 1 — get upload server
+        # Step 1 — get server
         srv_r = requests.get(
             "https://filemirage.com/api/servers",
             headers=headers,
             timeout=30,
         )
-        srv_j = srv_r.json()
+        srv_j = _safe_json(srv_r)
+        if not srv_j:
+            return (
+                f"❌ Filemirage: response server kosong\n"
+                f"HTTP {srv_r.status_code}\n{srv_r.text[:300]}"
+            )
         if not srv_j.get("success"):
-            return f"❌ Filemirage: gagal dapat server — {srv_j.get('message', srv_r.text[:200])}"
+            return f"❌ Filemirage get server gagal: {srv_j.get('message', str(srv_j)[:200])}"
 
-        server    = srv_j["data"]["server"].rstrip("/")
-        upload_id = srv_j["data"]["upload_id"]
-        filename  = os.path.basename(path)
-        file_size = os.path.getsize(path)
+        server       = srv_j["data"]["server"].rstrip("/")
+        upload_id    = srv_j["data"]["upload_id"]
+        filename     = os.path.basename(path)
+        file_size    = os.path.getsize(path)
         total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
-        upload_url = f"{server}/upload.php"
+        upload_url   = f"{server}/upload.php"
 
         # Step 2 — upload chunk(s)
         last_rj = {}
@@ -152,91 +185,127 @@ def _upload_filemirage(path: str, key: str) -> str:
                     data={
                         "filename":     filename,
                         "upload_id":    upload_id,
-                        "chunk_number": i,
-                        "total_chunks": total_chunks,
+                        "chunk_number": str(i),
+                        "total_chunks": str(total_chunks),
                     },
                     timeout=600,
                 )
-                try:
-                    last_rj = up_r.json()
-                except Exception:
-                    return f"❌ Filemirage: response bukan JSON — {up_r.text[:300]}"
+                up_j = _safe_json(up_r)
+                if not up_j:
+                    return (
+                        f"❌ Filemirage chunk {i}: response kosong\n"
+                        f"HTTP {up_r.status_code}\n{up_r.text[:300]}"
+                    )
+                if not up_j.get("success"):
+                    return f"❌ Filemirage chunk {i} gagal: {up_j.get('message', str(up_j)[:200])}"
+                last_rj = up_j
 
-                if not last_rj.get("success"):
-                    return f"❌ Filemirage chunk {i} gagal: {last_rj.get('message', up_r.text[:200])}"
-
-        return last_rj.get("data", {}).get("url") or "❌ Filemirage: URL tidak ditemukan di response"
+        result_url = last_rj.get("data", {}).get("url")
+        if result_url:
+            return result_url
+        return f"❌ Filemirage: selesai tapi URL tidak ada — {last_rj}"
 
     except Exception as e:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (web scraping — login email:password) ─────────────────
+# ── Upload: Transfer.it (web scraping) ────────────────────────────────────────
 def _upload_transferit(path: str, key: str) -> str:
     """
     Transfer.it tidak punya API resmi.
-    Gunakan /settransferit email:password untuk login.
+    key format: email:password
+    Simpan pakai: /settransferit email@kamu.com:passwordkamu
     """
+    import re
     import requests
 
     if not key or ":" not in key:
-        return "❌ Transfer.it butuh email:password. Gunakan /settransferit email@kamu.com:passwordkamu"
+        return (
+            "❌ Transfer.it butuh email:password\n"
+            "Gunakan: /settransferit email@kamu.com:passwordkamu"
+        )
 
     email, password = key.split(":", 1)
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
     })
 
     try:
-        # Step 1 — ambil CSRF token
-        home = session.get("https://transfer.it/", timeout=30)
+        # Step 1 — ambil CSRF dari halaman login
+        login_page = session.get("https://transfer.it/login", timeout=30)
         csrf = ""
-        for line in home.text.splitlines():
-            if 'csrf' in line.lower() and 'content' in line.lower():
-                import re
-                m = re.search(r'content=["\']([^"\']+)["\']', line)
-                if m:
-                    csrf = m.group(1)
-                    break
-
-        # Step 2 — login
-        login_r = session.post(
-            "https://transfer.it/login",
-            json={"email": email, "password": password, "_token": csrf},
-            headers={"X-CSRF-TOKEN": csrf, "Referer": "https://transfer.it/"},
-            timeout=30,
+        m = re.search(
+            r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+            login_page.text,
         )
-        if login_r.status_code not in (200, 302) or "logout" not in login_r.text.lower():
-            # coba form login biasa
-            login_r = session.post(
-                "https://transfer.it/login",
-                data={"email": email, "password": password, "_token": csrf},
-                headers={"Referer": "https://transfer.it/login"},
-                timeout=30,
-                allow_redirects=True,
+        if not m:
+            m = re.search(
+                r'<meta name=["\']csrf-token["\'] content=["\']([^"\']+)["\']',
+                login_page.text,
             )
+        if m:
+            csrf = m.group(1)
 
-        # Step 3 — upload
+        # Step 2 — POST login
+        session.post(
+            "https://transfer.it/login",
+            data={"_token": csrf, "email": email, "password": password},
+            headers={"Referer": "https://transfer.it/login"},
+            timeout=30,
+            allow_redirects=True,
+        )
+
+        # Step 3 — ambil CSRF baru setelah login
+        home = session.get("https://transfer.it/", timeout=30)
+        if "logout" not in home.text.lower():
+            return "❌ Transfer.it: login gagal, cek email/password"
+
+        m2 = re.search(
+            r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+            home.text,
+        )
+        if not m2:
+            m2 = re.search(
+                r'<meta name=["\']csrf-token["\'] content=["\']([^"\']+)["\']',
+                home.text,
+            )
+        csrf2 = m2.group(1) if m2 else csrf
+
+        # Step 4 — upload
         filename = os.path.basename(path)
         with open(path, "rb") as f:
             up_r = session.post(
                 "https://transfer.it/upload",
                 files={"file": (filename, f)},
+                data={"_token": csrf2},
+                headers={
+                    "Referer": "https://transfer.it/",
+                    "X-CSRF-TOKEN": csrf2,
+                },
                 timeout=600,
             )
 
-        try:
-            rj = up_r.json()
-            return rj.get("url") or rj.get("link") or str(rj)
-        except Exception:
-            # cari link di HTML response
-            import re
-            m = re.search(r'https://transfer\.it/\S+', up_r.text)
-            if m:
-                return m.group(0)
-            return f"❌ Transfer.it: tidak bisa parse response — {up_r.text[:300]}"
+        rj = _safe_json(up_r)
+        if rj:
+            url = rj.get("url") or rj.get("link") or rj.get("download_url")
+            if url:
+                return url
+            return f"❌ Transfer.it JSON tapi tidak ada URL: {str(rj)[:300]}"
+
+        # Fallback cari link di HTML
+        m3 = re.search(r'https://transfer\.it/\S+', up_r.text)
+        if m3:
+            return m3.group(0).rstrip('",\'')
+
+        return (
+            f"❌ Transfer.it: tidak bisa parse response\n"
+            f"HTTP {up_r.status_code}\n{up_r.text[:300]}"
+        )
 
     except Exception as e:
         return f"❌ Transfer.it exception: {e}"
@@ -253,10 +322,15 @@ def _upload_player4me(path: str, key: str) -> str:
                 data={"api_key": key},
                 timeout=600,
             )
-        rj = r.json()
-        if r.status_code == 200:
-            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
-        return f"❌ Player4me error: {r.text[:200]}"
+        rj = _safe_json(r)
+        if rj and r.status_code == 200:
+            return (
+                rj.get("data", {}).get("url")
+                or rj.get("url")
+                or rj.get("link")
+                or str(rj)
+            )
+        return f"❌ Player4me HTTP {r.status_code}: {r.text[:200]}"
     except Exception as e:
         return f"❌ Player4me exception: {e}"
 
@@ -272,10 +346,15 @@ def _upload_akirabox(path: str, key: str) -> str:
                 data={"api_key": key},
                 timeout=600,
             )
-        rj = r.json()
-        if r.status_code == 200:
-            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
-        return f"❌ Akirabox error: {r.text[:200]}"
+        rj = _safe_json(r)
+        if rj and r.status_code == 200:
+            return (
+                rj.get("data", {}).get("url")
+                or rj.get("url")
+                or rj.get("link")
+                or str(rj)
+            )
+        return f"❌ Akirabox HTTP {r.status_code}: {r.text[:200]}"
     except Exception as e:
         return f"❌ Akirabox exception: {e}"
 
