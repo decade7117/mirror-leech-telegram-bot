@@ -128,6 +128,3 @@ async def mirror_file_cmd(client, message):
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# Mendaftarkan command ke dispatcher bot MLTB
-bot.add_handler(MessageHandler(set_api_key_cmd, filters=command(set_host_list)))
-bot.add_handler(MessageHandler(mirror_file_cmd, filters=command(host_list)))
