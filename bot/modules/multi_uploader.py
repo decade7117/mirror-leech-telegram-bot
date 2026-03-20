@@ -1,7 +1,10 @@
 import os
 import requests
 import urllib.parse
-from pyrogram import filters, Client
+from pyrogram.handlers import MessageHandler
+from pyrogram.filters import command
+from bot import bot  # Import 'bot' instance bawaan MLTB
+from bot.helper.ext_utils.bot_utils import new_task
 
 # --- PENYIMPANAN API KEY SEMENTARA ---
 USER_API_KEYS = {
@@ -51,26 +54,28 @@ def upload_generic_host(file_path, upload_url, api_key):
 # ==========================================
 
 host_list = ['gofile', 'pixeldrain', 'transferit', 'filemirage', 'buzzheavier', 'player4me', 'akirabox']
+set_host_list = [f"set{host}" for host in host_list]
 
-# COMMAND UNTUK SET API KEY (/setgofile, /setplayer4me, dll)
-@Client.on_message(filters.command([f"set{host}" for host in host_list]))
+@new_task
 async def set_api_key_cmd(client, message):
-    host_name = message.command[0].replace('set', '')
-    if len(message.command) > 1:
-        USER_API_KEYS[host_name] = message.command[1]
+    args = message.text.split()
+    host_name = args[0].replace('/', '').replace('set', '')
+    
+    if len(args) > 1:
+        USER_API_KEYS[host_name] = args[1]
         await message.reply(f"✅ API Key untuk **{host_name}** berhasil disimpan!")
     else:
         await message.reply(f"Gunakan format: `/set{host_name} [API_KEY]`")
 
-# COMMAND UNTUK MIRROR (/gofile [LINK], /player4me [LINK], dll)
-@Client.on_message(filters.command(host_list))
+@new_task
 async def mirror_file_cmd(client, message):
-    host_name = message.command[0]
+    args = message.text.split(maxsplit=1)
+    host_name = args[0].replace('/', '')
     
-    if len(message.command) < 2:
-        return await message.reply(f"Kirim Link file yang ingin di-mirror: `/{host_name} https://link-video.com/file.mp4`")
+    if len(args) < 2:
+        return await message.reply(f"Kirim Link file yang ingin di-mirror:\n`/{host_name} https://link-video.com/file.mp4`")
     
-    input_data = message.command[1]
+    input_data = args[1]
     file_path = input_data
     msg = await message.reply(f"🔍 Memproses permintaan untuk {host_name}...")
 
@@ -78,18 +83,15 @@ async def mirror_file_cmd(client, message):
     if input_data.startswith("http://") or input_data.startswith("https://"):
         await msg.edit_text("⬇️ Sedang mengunduh file dari link ke server...")
         
-        # Buat folder sementara jika belum ada
         if not os.path.exists("downloads"):
             os.makedirs("downloads")
             
-        # Ambil nama file dari URL
         filename = input_data.split("/")[-1].split("?")[0]
         if not filename:
             filename = "downloaded_file.bin"
             
         file_path = os.path.join("downloads", filename)
         
-        # Proses Download
         try:
             with requests.get(input_data, stream=True) as r:
                 r.raise_for_status()
@@ -122,7 +124,10 @@ async def mirror_file_cmd(client, message):
 
     await msg.edit_text(f"**✅ Berhasil Mirror ke {host_name.capitalize()}**\nLink Hasil: `{link}`")
     
-    # Bersihkan file hasil download agar server tidak penuh
     if input_data.startswith("http://") or input_data.startswith("https://"):
         if os.path.exists(file_path):
             os.remove(file_path)
+
+# Mendaftarkan command ke dispatcher bot MLTB
+bot.add_handler(MessageHandler(set_api_key_cmd, filters=command(set_host_list)))
+bot.add_handler(MessageHandler(mirror_file_cmd, filters=command(host_list)))
