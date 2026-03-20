@@ -99,11 +99,6 @@ def _upload_pixeldrain(path: str, key: str) -> str:
 
 # ── Upload: Buzzheavier ───────────────────────────────────────────────────────
 def _upload_buzzheavier(path: str, key: str) -> str:
-    """
-    PUT https://w.buzzheavier.com/<filename>
-    Response: {"code": 201, "data": {"id": "xxxx", ...}}
-    URL hasil: https://buzzheavier.com/<id>
-    """
     import requests
     try:
         fname = urllib.parse.quote(os.path.basename(path), safe="")
@@ -122,7 +117,6 @@ def _upload_buzzheavier(path: str, key: str) -> str:
         rj = _safe_json(r)
         if rj:
             data = rj.get("data", {})
-            # Ada field url langsung atau konstruksi dari id
             url = data.get("url")
             if not url and data.get("id"):
                 url = f"https://buzzheavier.com/{data['id']}"
@@ -136,11 +130,16 @@ def _upload_buzzheavier(path: str, key: str) -> str:
 # ── Upload: Filemirage ────────────────────────────────────────────────────────
 def _upload_filemirage(path: str, key: str) -> str:
     """
-    1. GET https://filemirage.com/api/servers
-       Header: Authorization: Bearer <token>
-       Response: { success: true, data: { server: "https://...", upload_id: "..." } }
-    2. POST <server>/upload.php
-       fields: filename, upload_id, chunk_number, total_chunks, file
+    Flow:
+      1. GET https://filemirage.com/api/servers
+         Header: Authorization: Bearer <token>
+         Response: { success: true, data: { server, upload_id } }
+      2. POST <server>/upload.php  per chunk
+         - Intermediate chunks: server returns any response (may have success=false, message="Chunk uploaded")
+         - Final chunk: { success: true, data: { url: "https://..." } }
+
+    NOTE: "Chunk uploaded" in message = chunk diterima server, BUKAN error.
+    Kita skip validasi success untuk intermediate chunks, hanya cek URL di chunk terakhir.
     """
     import requests
 
@@ -161,7 +160,7 @@ def _upload_filemirage(path: str, key: str) -> str:
         if not srv_j:
             return (
                 f"❌ Filemirage: response server kosong\n"
-                f"HTTP {srv_r.status_code}\n{srv_r.text[:300]}"
+                f"HTTP {srv_r.status_code}: {srv_r.text[:300]}"
             )
         if not srv_j.get("success"):
             return f"❌ Filemirage get server gagal: {srv_j.get('message', str(srv_j)[:200])}"
@@ -173,11 +172,13 @@ def _upload_filemirage(path: str, key: str) -> str:
         total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
         upload_url   = f"{server}/upload.php"
 
-        # Step 2 — upload chunk(s)
+        # Step 2 — upload chunks
         last_rj = {}
         with open(path, "rb") as fh:
             for i in range(total_chunks):
                 chunk_data = fh.read(CHUNK_SIZE)
+                is_last    = (i == total_chunks - 1)
+
                 up_r = requests.post(
                     upload_url,
                     headers=headers,
@@ -190,34 +191,58 @@ def _upload_filemirage(path: str, key: str) -> str:
                     },
                     timeout=600,
                 )
+
                 up_j = _safe_json(up_r)
-                if not up_j:
+
+                if up_r.status_code not in (200, 201):
+                    # HTTP error yang nyata
                     return (
-                        f"❌ Filemirage chunk {i}: response kosong\n"
-                        f"HTTP {up_r.status_code}\n{up_r.text[:300]}"
+                        f"❌ Filemirage chunk {i}: HTTP {up_r.status_code}\n"
+                        f"{up_r.text[:300]}"
                     )
-                if not up_j.get("success"):
-                    return f"❌ Filemirage chunk {i} gagal: {up_j.get('message', str(up_j)[:200])}"
+
+                if up_j is None:
+                    return f"❌ Filemirage chunk {i}: response kosong\n{up_r.text[:300]}"
+
+                # "Chunk uploaded" = server terima chunk, bukan error
+                # Lanjut ke chunk berikutnya untuk intermediate
+                if not is_last:
+                    continue
+
+                # Chunk terakhir: ambil URL
                 last_rj = up_j
 
-        result_url = last_rj.get("data", {}).get("url")
+        # Cek URL dari response chunk terakhir
+        result_url = last_rj.get("data", {}).get("url") if isinstance(last_rj.get("data"), dict) else None
         if result_url:
             return result_url
-        return f"❌ Filemirage: selesai tapi URL tidak ada — {last_rj}"
+
+        # Fallback: kalau success=true tapi structure beda
+        if last_rj.get("success") and not result_url:
+            return f"❌ Filemirage: upload OK tapi URL tidak ada — {last_rj}"
+
+        # Kalau success=false tapi ada URL di data
+        if isinstance(last_rj.get("data"), dict) and last_rj["data"].get("url"):
+            return last_rj["data"]["url"]
+
+        return f"❌ Filemirage: response chunk terakhir tidak ada URL — {last_rj}"
 
     except Exception as e:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (web scraping) ────────────────────────────────────────
+# ── Upload: Transfer.it (web scraping - Laravel XSRF cookie) ─────────────────
 def _upload_transferit(path: str, key: str) -> str:
     """
-    Transfer.it tidak punya API resmi.
+    Transfer.it = Laravel app.
+    CSRF token bisa diambil dari:
+      - Cookie XSRF-TOKEN (set otomatis oleh Laravel)
+      - Hidden input _token di form
     key format: email:password
-    Simpan pakai: /settransferit email@kamu.com:passwordkamu
     """
     import re
     import requests
+    from urllib.parse import unquote
 
     if not key or ":" not in key:
         return (
@@ -231,52 +256,78 @@ def _upload_transferit(path: str, key: str) -> str:
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/122.0.0.0 Safari/537.36"
         ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
     })
 
-    try:
-        # Step 1 — ambil CSRF dari halaman login
-        login_page = session.get("https://transfer.it/login", timeout=30)
-        csrf = ""
+    def get_csrf(html_text, cookies):
+        """Ambil CSRF token dari HTML atau cookie XSRF-TOKEN."""
+        # 1. Dari cookie XSRF-TOKEN (Laravel standard)
+        xsrf_cookie = cookies.get("XSRF-TOKEN")
+        if xsrf_cookie:
+            return unquote(xsrf_cookie)
+        # 2. Dari hidden input _token
         m = re.search(
-            r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
-            login_page.text,
+            r'<input[^>]+name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+            html_text,
         )
-        if not m:
-            m = re.search(
-                r'<meta name=["\']csrf-token["\'] content=["\']([^"\']+)["\']',
-                login_page.text,
-            )
         if m:
-            csrf = m.group(1)
+            return m.group(1)
+        # 3. Dari meta csrf-token
+        m = re.search(
+            r'<meta[^>]+name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']',
+            html_text,
+        )
+        if m:
+            return m.group(1)
+        return ""
+
+    try:
+        # Step 1 — GET login page (trigger session + set XSRF cookie)
+        login_page = session.get("https://transfer.it/login", timeout=30)
+        csrf = get_csrf(login_page.text, session.cookies)
+
+        if not csrf:
+            return "❌ Transfer.it: tidak bisa ambil CSRF token dari halaman login"
 
         # Step 2 — POST login
-        session.post(
+        login_r = session.post(
             "https://transfer.it/login",
-            data={"_token": csrf, "email": email, "password": password},
-            headers={"Referer": "https://transfer.it/login"},
+            data={
+                "_token":   csrf,
+                "email":    email,
+                "password": password,
+            },
+            headers={
+                "Referer":       "https://transfer.it/login",
+                "Content-Type":  "application/x-www-form-urlencoded",
+                "X-CSRF-TOKEN":  csrf,
+            },
             timeout=30,
             allow_redirects=True,
         )
 
-        # Step 3 — ambil CSRF baru setelah login
-        home = session.get("https://transfer.it/", timeout=30)
-        if "logout" not in home.text.lower():
-            return "❌ Transfer.it: login gagal, cek email/password"
+        # Ambil CSRF baru setelah login (session regenerated)
+        csrf2 = get_csrf(login_r.text, session.cookies)
+        if not csrf2:
+            csrf2 = csrf
 
-        m2 = re.search(
-            r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
-            home.text,
+        # Cek login berhasil
+        is_logged_in = (
+            "logout" in login_r.text.lower()
+            or "/dashboard" in login_r.url
+            or login_r.url.rstrip("/") == "https://transfer.it"
         )
-        if not m2:
-            m2 = re.search(
-                r'<meta name=["\']csrf-token["\'] content=["\']([^"\']+)["\']',
-                home.text,
+        if not is_logged_in:
+            return (
+                f"❌ Transfer.it: login gagal\n"
+                f"URL setelah login: {login_r.url}\n"
+                f"Cek email/password"
             )
-        csrf2 = m2.group(1) if m2 else csrf
 
-        # Step 4 — upload
+        # Step 3 — Upload
         filename = os.path.basename(path)
         with open(path, "rb") as f:
             up_r = session.post(
@@ -284,8 +335,9 @@ def _upload_transferit(path: str, key: str) -> str:
                 files={"file": (filename, f)},
                 data={"_token": csrf2},
                 headers={
-                    "Referer": "https://transfer.it/",
+                    "Referer":      "https://transfer.it/",
                     "X-CSRF-TOKEN": csrf2,
+                    "Accept":       "application/json, */*",
                 },
                 timeout=600,
             )
@@ -297,7 +349,7 @@ def _upload_transferit(path: str, key: str) -> str:
                 return url
             return f"❌ Transfer.it JSON tapi tidak ada URL: {str(rj)[:300]}"
 
-        # Fallback cari link di HTML
+        # Fallback: cari link di HTML
         m3 = re.search(r'https://transfer\.it/\S+', up_r.text)
         if m3:
             return m3.group(0).rstrip('",\'')
@@ -418,7 +470,7 @@ async def multi_mirror_cmd(_, message):
         await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
         return
 
-    size_kb = os.path.getsize(dest) // 1024
+    size_kb  = os.path.getsize(dest) // 1024
     size_str = f"{size_kb // 1024} MB" if size_kb > 1024 else f"{size_kb} KB"
 
     # Step 2: Upload
