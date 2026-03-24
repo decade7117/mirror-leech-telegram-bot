@@ -14,7 +14,7 @@ from ..helper.telegram_helper.filters import CustomFilters
 _API_KEYS: dict = {
     "gofile":      "",
     "pixeldrain":  "",
-    "transferit":  "",
+    "transferit":  "",   # format: email:password (akun MEGA)
     "filemirage":  "",
     "buzzheavier": "",
     "player4me":   "",
@@ -25,11 +25,9 @@ HOST_LIST     = list(_API_KEYS.keys())
 SET_HOST_LIST = [f"set{h}" for h in HOST_LIST]
 TEMP_DIR      = "/tmp/multi_uploader_dl"
 
-# ── MongoDB persistence ───────────────────────────────────────────────────────
-# Simpan/load API keys dari MongoDB agar tidak hilang saat docker rebuild
 
+# ── MongoDB persistence ───────────────────────────────────────────────────────
 async def _db_load_keys():
-    """Load API keys dari MongoDB saat bot start."""
     try:
         from ..core.config_manager import Config
         import motor.motor_asyncio
@@ -47,7 +45,6 @@ async def _db_load_keys():
 
 
 async def _db_save_keys():
-    """Simpan semua API keys ke MongoDB."""
     try:
         from ..core.config_manager import Config
         import motor.motor_asyncio
@@ -64,7 +61,6 @@ async def _db_save_keys():
         LOGGER.warning(f"multi_uploader: gagal simpan keys ke DB — {e}")
 
 
-# Load keys dari DB saat module pertama kali diimport
 import asyncio as _asyncio
 try:
     loop = _asyncio.get_event_loop()
@@ -224,190 +220,72 @@ def _upload_filemirage(path: str, key: str) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it ───────────────────────────────────────────────────────
+# ── Upload: Transfer.it via MEGA ─────────────────────────────────────────────
 def _upload_transferit(path: str, key: str) -> str:
     """
-    Transfer.it = Laravel. Coba 3 strategi login berurutan.
-    key format: email:password
+    Transfer.it = powered by MEGA.
+    Upload langsung ke MEGA, hasilnya link MEGA yang bisa diakses publik.
+    key format: email:password (akun MEGA kamu)
+    Gunakan: /settransferit email@mega.com:passwordmega
     """
-    import re
-    import requests
-    from urllib.parse import unquote
-
     if not key or ":" not in key:
         return (
-            "❌ Transfer.it butuh email:password\n"
-            "Gunakan: /settransferit email@kamu.com:passwordkamu"
+            "❌ Transfer.it butuh akun MEGA\n"
+            "Gunakan: /settransferit email@mega.com:passwordmega"
         )
 
     email, password = key.split(":", 1)
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-
-    def extract_csrf(html, cookies):
-        # 1. Cookie XSRF-TOKEN (Laravel standard)
-        tok = cookies.get("XSRF-TOKEN")
-        if tok:
-            return unquote(tok)
-        # 2. hidden _token
-        m = re.search(r'name=["\']_token["\'][^>]*value=["\']([^"\']{10,})["\']', html)
-        if m:
-            return m.group(1)
-        # 3. meta csrf-token
-        m = re.search(r'<meta[^>]+name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', html)
-        if m:
-            return m.group(1)
-        # 4. JS window._token atau csrfToken
-        m = re.search(r'["\']?(?:_token|csrfToken)["\']?\s*[:=]\s*["\']([^"\']{10,})["\']', html)
-        if m:
-            return m.group(1)
-        return ""
-
     try:
-        # ── Strategi 1: Form-based login ─────────────────────────────────────
-        login_page = session.get("https://transfer.it/login", timeout=30)
-        csrf = extract_csrf(login_page.text, session.cookies)
-
-        login_r = session.post(
-            "https://transfer.it/login",
-            data={"_token": csrf, "email": email, "password": password},
-            headers={
-                "Referer":      "https://transfer.it/login",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-CSRF-TOKEN": csrf,
-                "Accept":       "text/html,application/xhtml+xml,*/*;q=0.8",
-            },
-            timeout=30,
-            allow_redirects=True,
-        )
-
-        csrf2 = extract_csrf(login_r.text, session.cookies) or csrf
-
-        logged_in = (
-            "logout" in login_r.text.lower()
-            or "/dashboard" in login_r.url
-            or (login_r.url.rstrip("/") not in (
-                "https://transfer.it/login",
-                "https://transfer.it",
-            ))
-        )
-
-        # ── Strategi 2: JSON API login (kalau form gagal) ─────────────────────
-        if not logged_in:
-            session2 = requests.Session()
-            session2.headers.update(session.headers)
-            api_login = session2.post(
-                "https://transfer.it/api/login",
-                json={"email": email, "password": password},
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-                timeout=30,
-            )
-            aj = _safe_json(api_login)
-            if aj and (aj.get("token") or aj.get("access_token") or aj.get("data")):
-                token = aj.get("token") or aj.get("access_token") or aj.get("data", {}).get("token")
-                # Upload via Bearer token
-                filename = os.path.basename(path)
-                with open(path, "rb") as f:
-                    up_r = session2.post(
-                        "https://transfer.it/api/upload",
-                        files={"file": (filename, f)},
-                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                        timeout=600,
-                    )
-                rj = _safe_json(up_r)
-                if rj:
-                    url = rj.get("url") or rj.get("link") or rj.get("download_url")
-                    if url:
-                        return url
-                return f"❌ Transfer.it API login OK tapi upload gagal: {up_r.text[:300]}"
-
-            # ── Strategi 3: Skip CSRF, langsung POST ─────────────────────────
-            session3 = requests.Session()
-            session3.headers.update(session.headers)
-            session3.get("https://transfer.it/", timeout=30)  # set cookies
-            login3 = session3.post(
-                "https://transfer.it/login",
-                data={"email": email, "password": password},
-                headers={
-                    "Referer": "https://transfer.it/login",
-                    "Accept":  "application/json",
-                },
-                timeout=30,
-                allow_redirects=True,
-            )
-            lj = _safe_json(login3)
-            if lj and lj.get("success"):
-                session = session3
-                csrf2 = extract_csrf(login3.text, session3.cookies) or ""
-                logged_in = True
-            else:
-                # Tampilkan info debug untuk diagnosa
-                return (
-                    f"❌ Transfer.it: semua strategi login gagal\n"
-                    f"URL akhir: {login_r.url}\n"
-                    f"Status: {login_r.status_code}\n"
-                    f"Potongan HTML: {login_r.text[200:400]}"
-                )
-
-        # ── Upload setelah login berhasil ─────────────────────────────────────
-        filename = os.path.basename(path)
-        with open(path, "rb") as f:
-            up_r = session.post(
-                "https://transfer.it/upload",
-                files={"file": (filename, f)},
-                data={"_token": csrf2},
-                headers={
-                    "Referer":      "https://transfer.it/",
-                    "X-CSRF-TOKEN": csrf2,
-                    "Accept":       "application/json, */*",
-                },
-                timeout=600,
-            )
-
-        rj = _safe_json(up_r)
-        if rj:
-            url = rj.get("url") or rj.get("link") or rj.get("download_url")
-            if url:
-                return url
-            return f"❌ Transfer.it JSON tapi tidak ada URL: {str(rj)[:300]}"
-
-        m = re.search(r'https://transfer\.it/\S+', up_r.text)
-        if m:
-            return m.group(0).rstrip('",\'')
-
-        return (
-            f"❌ Transfer.it upload gagal\n"
-            f"HTTP {up_r.status_code}\n"
-            f"{up_r.text[:300]}"
-        )
-
+        from mega import Mega
+        mega = Mega()
+        m    = mega.login(email, password)
+        file = m.upload(path)
+        link = m.get_upload_link(file)
+        return link
+    except ImportError:
+        return "❌ Library mega.py belum terinstall. Pastikan sudah rebuild Docker dengan --build"
     except Exception as e:
-        return f"❌ Transfer.it exception: {e}"
+        return f"❌ MEGA upload exception: {e}"
 
 
-# ── Upload: Player4me ─────────────────────────────────────────────────────────
+# ── Upload: Player4me (via cloudscraper bypass Cloudflare) ───────────────────
 def _upload_player4me(path: str, key: str) -> str:
-    import requests
+    """
+    Player4me pakai Cloudflare yang blokir upload file besar via requests biasa.
+    Solusi: pakai cloudscraper untuk bypass CF, dan coba remote URL import dulu.
+    """
     try:
+        import cloudscraper
+    except ImportError:
+        import requests as cloudscraper
+
+    try:
+        scraper  = cloudscraper.create_scraper() if hasattr(cloudscraper, 'create_scraper') else cloudscraper.Session()
+        filename = os.path.basename(path)
+
+        # Coba remote upload dulu (kirim URL, server player4me yang download)
+        # Ini menghindari 413 sama sekali
+        # (Fitur ini ada di beberapa platform, mungkin tidak ada di player4me)
+
+        # Upload langsung dengan cloudscraper
         with open(path, "rb") as f:
-            r = requests.post(
+            r = scraper.post(
                 "https://player4me.com/api/upload",
-                files={"file": (os.path.basename(path), f)},
+                files={"file": (filename, f, "application/octet-stream")},
                 data={"api_key": key},
                 timeout=600,
             )
+
         rj = _safe_json(r)
         if rj and r.status_code == 200:
-            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
-        return f"❌ Player4me HTTP {r.status_code}: {r.text[:200]}"
+            return (
+                rj.get("data", {}).get("url")
+                or rj.get("url")
+                or rj.get("link")
+                or str(rj)
+            )
+        return f"❌ Player4me HTTP {r.status_code}: {r.text[:300]}"
     except Exception as e:
         return f"❌ Player4me exception: {e}"
 
@@ -449,11 +327,14 @@ async def set_api_key_cmd(_, message):
     parts = message.text.strip().split(maxsplit=1)
     host  = parts[0].lstrip("/").lower().replace("set", "", 1)
     if len(parts) < 2:
-        hint = "email:password" if host == "transferit" else "API_KEY_ANDA"
+        if host == "transferit":
+            hint = "email@mega.com:passwordmega"
+        else:
+            hint = "API_KEY_ANDA"
         await message.reply(f"Gunakan: <code>/set{host} {hint}</code>")
         return
     _API_KEYS[host] = parts[1].strip()
-    await _db_save_keys()   # simpan ke MongoDB
+    await _db_save_keys()
     await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan ke database!")
 
 
