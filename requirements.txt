@@ -16,6 +16,7 @@ gunicorn
 httpx
 jinja2
 lxml
+mega.py
 natsort
 par2cmdline-turbo
 pillow
