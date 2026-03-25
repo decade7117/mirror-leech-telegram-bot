@@ -28,7 +28,6 @@ requests
 telegraph
 tenacity
 tgcrypto
-tus-py-client
 urllib3
 uvicorn
 uvloop
