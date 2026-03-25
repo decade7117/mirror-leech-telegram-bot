@@ -16,6 +16,7 @@ gunicorn
 httpx
 jinja2
 lxml
+motor
 natsort
 par2cmdline-turbo
 pillow
@@ -27,6 +28,7 @@ requests
 telegraph
 tenacity
 tgcrypto
+tus-py-client
 urllib3
 uvicorn
 uvloop
