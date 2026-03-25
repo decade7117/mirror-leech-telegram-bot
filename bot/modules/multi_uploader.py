@@ -24,8 +24,10 @@ _API_KEYS: dict = {
 HOST_LIST     = list(_API_KEYS.keys())
 SET_HOST_LIST = [f"set{h}" for h in HOST_LIST]
 TEMP_DIR      = "/tmp/multi_uploader_dl"
-# Folder download default MLTB
 DOWNLOAD_DIR  = "/app/downloads"
+
+# Player4me API base
+P4M_BASE = "https://player4me.com"
 
 
 # ── MongoDB persistence ───────────────────────────────────────────────────────
@@ -96,7 +98,6 @@ def _sizeof_fmt(num_bytes: int) -> str:
 
 
 def _download_url(url: str, dest: str):
-    """Download dari HTTP URL ke file lokal."""
     import requests
     try:
         with requests.get(url, stream=True, timeout=600) as r:
@@ -110,10 +111,6 @@ def _download_url(url: str, dest: str):
 
 
 def _find_file_in_downloads(name: str):
-    """
-    Cari file di folder downloads MLTB secara rekursif.
-    Return full path kalau ketemu, None kalau tidak.
-    """
     if not os.path.isdir(DOWNLOAD_DIR):
         return None
     name_lower = name.lower()
@@ -253,39 +250,203 @@ def _upload_filemirage(path: str, key: str) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it / Akirabox / Player4me ────────────────────────────────
-def _upload_transferit(path: str, key: str) -> str:
-    return "❌ Transfer.it (MEGA) belum didukung. Gunakan /gofile, /pixeldrain, /buzzheavier, atau /filemirage."
+# ── Upload: Player4me (TUS protocol + advance-upload) ────────────────────────
+def _p4m_headers(key: str) -> dict:
+    return {"api-token": key, "Accept": "application/json"}
 
 
-def _upload_player4me(path: str, key: str) -> str:
+def _p4m_advance_upload_url(url: str, key: str, name: str = None) -> str:
+    """
+    Player4me advance-upload: kirim URL ke server mereka, mereka yang download.
+    Tidak ada 413 karena kita tidak upload file, hanya kirim URL.
+    Endpoint: POST /api/v1/video/advance-upload
+    Payload:  { "url": "...", "name": "..." }
+    Returns task_id, lalu poll status sampai selesai.
+    """
+    import requests
+    import time
+
+    headers = _p4m_headers(key)
+
     try:
-        import cloudscraper
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        # Buat task advance-upload
+        payload = {"url": url}
+        if name:
+            payload["name"] = name
+
+        r = requests.post(
+            f"{P4M_BASE}/api/v1/video/advance-upload",
+            json=payload,
+            headers=headers,
+            timeout=30,
         )
-    except Exception:
-        import requests
-        scraper = requests.Session()
-    try:
-        with open(path, "rb") as f:
-            r = scraper.post(
-                "https://player4me.com/api/upload",
-                files={"file": (os.path.basename(path), f, "video/mp4")},
-                data={"api_key": key},
-                timeout=600,
-            )
-        if r.status_code == 413:
-            size_mb = os.path.getsize(path) / 1024 / 1024
-            return f"❌ Player4me: file terlalu besar ({size_mb:.1f} MB). Cloudflare WAF membatasi upload langsung. Gunakan /gofile atau /pixeldrain."
         rj = _safe_json(r)
-        if rj and r.status_code == 200:
-            return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
-        return f"❌ Player4me HTTP {r.status_code}: {r.text[:300]}"
+        if r.status_code not in (200, 201) or not rj:
+            return f"❌ Player4me advance-upload gagal: HTTP {r.status_code} — {r.text[:300]}"
+
+        task_id = rj.get("id")
+        if not task_id:
+            return f"❌ Player4me: tidak dapat task ID — {rj}"
+
+        # Poll status (max 30 menit)
+        max_wait = 1800
+        interval = 15
+        waited   = 0
+        while waited < max_wait:
+            time.sleep(interval)
+            waited += interval
+            status_r = requests.get(
+                f"{P4M_BASE}/api/v1/video/advance-upload/{task_id}",
+                headers=headers,
+                timeout=30,
+            )
+            sj = _safe_json(status_r)
+            if not sj:
+                continue
+
+            status = sj.get("status", "")
+            if status == "Completed":
+                # Ambil video ID dari task
+                videos = sj.get("videos", [])
+                if videos:
+                    vid_id = videos[0] if isinstance(videos[0], str) else videos[0].get("id")
+                    return f"https://player4me.com/video/{vid_id}"
+                return f"✅ Player4me upload selesai (task {task_id}) tapi video ID tidak tersedia"
+            elif status in ("Failed", "Error"):
+                err = sj.get("error", "Unknown error")
+                return f"❌ Player4me task gagal: {err}"
+            # Masih processing, lanjut poll
+
+        return f"❌ Player4me: timeout setelah {max_wait}s. Task ID: {task_id} — cek manual di dashboard"
+
     except Exception as e:
         return f"❌ Player4me exception: {e}"
 
 
+def _p4m_tus_upload(path: str, key: str) -> str:
+    """
+    Player4me TUS upload untuk file lokal.
+    Flow:
+      1. GET /api/v1/video/upload → { tusUrl, accessToken }
+      2. TUS POST (create) dengan metadata
+      3. TUS PATCH (upload chunks, 50MB each)
+    """
+    import requests
+    import base64
+
+    headers = _p4m_headers(key)
+    CHUNK   = 52_428_800  # 50 MB — sesuai docs player4me
+
+    try:
+        # Step 1: get TUS endpoint + access token
+        ep_r = requests.get(
+            f"{P4M_BASE}/api/v1/video/upload",
+            headers=headers,
+            timeout=30,
+        )
+        ep_j = _safe_json(ep_r)
+        if not ep_j or ep_r.status_code != 200:
+            return f"❌ Player4me TUS endpoint gagal: {ep_r.text[:200]}"
+
+        tus_url      = ep_j.get("tusUrl", "").rstrip("/") + "/"
+        access_token = ep_j.get("accessToken", "")
+        if not tus_url or not access_token:
+            return f"❌ Player4me: tidak dapat tusUrl/accessToken — {ep_j}"
+
+        filename  = os.path.basename(path)
+        file_size = os.path.getsize(path)
+        filetype  = "video/mp4"
+
+        # Encode metadata (TUS spec: base64 key-value pairs)
+        def b64(s):
+            return base64.b64encode(s.encode()).decode()
+
+        metadata = (
+            f"accessToken {b64(access_token)},"
+            f"filename {b64(filename)},"
+            f"filetype {b64(filetype)}"
+        )
+
+        # Step 2: TUS Create (POST)
+        create_r = requests.post(
+            tus_url,
+            headers={
+                "Tus-Resumable": "1.0.0",
+                "Upload-Length":   str(file_size),
+                "Upload-Metadata": metadata,
+                "Content-Length":  "0",
+                "api-token":       key,
+            },
+            timeout=30,
+        )
+        if create_r.status_code != 201:
+            return f"❌ Player4me TUS create gagal: HTTP {create_r.status_code} — {create_r.text[:200]}"
+
+        upload_location = create_r.headers.get("Location", "")
+        if not upload_location:
+            return "❌ Player4me TUS: tidak dapat upload location"
+
+        # Step 3: TUS PATCH (upload chunks)
+        offset = 0
+        with open(path, "rb") as fh:
+            while offset < file_size:
+                chunk = fh.read(CHUNK)
+                patch_r = requests.patch(
+                    upload_location,
+                    data=chunk,
+                    headers={
+                        "Tus-Resumable":  "1.0.0",
+                        "Upload-Offset":  str(offset),
+                        "Content-Type":   "application/offset+octet-stream",
+                        "Content-Length": str(len(chunk)),
+                        "api-token":      key,
+                    },
+                    timeout=600,
+                )
+                if patch_r.status_code not in (200, 204):
+                    return f"❌ Player4me TUS chunk gagal di offset {offset}: HTTP {patch_r.status_code}"
+                offset += len(chunk)
+
+        # Upload selesai — cari video ID dari response header atau URL
+        # Location URL biasanya mengandung video ID
+        vid_id = upload_location.rstrip("/").split("/")[-1]
+        if vid_id:
+            return f"https://player4me.com/video/{vid_id}"
+
+        return f"✅ Player4me upload selesai! Cek dashboard untuk link video."
+
+    except Exception as e:
+        return f"❌ Player4me TUS exception: {e}"
+
+
+def _upload_player4me(path: str, key: str) -> str:
+    """
+    Player4me upload — gunakan TUS protocol (bukan multipart POST).
+    API key disimpan di header 'api-token'.
+    """
+    if not key:
+        return "❌ Player4me butuh API key. Gunakan /setplayer4me API_KEY_ANDA"
+
+    return _p4m_tus_upload(path, key)
+
+
+def _upload_player4me_url(url: str, key: str, name: str = None) -> str:
+    """Player4me via advance-upload (server mereka yang download dari URL)."""
+    if not key:
+        return "❌ Player4me butuh API key. Gunakan /setplayer4me API_KEY_ANDA"
+    return _p4m_advance_upload_url(url, key, name)
+
+
+# ── Upload: Transfer.it (disabled) ───────────────────────────────────────────
+def _upload_transferit(path: str, key: str) -> str:
+    return (
+        "❌ Transfer.it (MEGA) tidak didukung saat ini.\n"
+        "Transfer.it butuh enkripsi client-side MEGA yang kompleks.\n"
+        "Gunakan: /gofile, /pixeldrain, /filemirage, atau /buzzheavier"
+    )
+
+
+# ── Upload: Akirabox ──────────────────────────────────────────────────────────
 def _upload_akirabox(path: str, key: str) -> str:
     import requests
     try:
@@ -323,13 +484,13 @@ async def set_api_key_cmd(_, message):
     host  = parts[0].lstrip("/").lower().replace("set", "", 1)
     if len(parts) < 2:
         hints = {
-            "gofile":     "API_TOKEN_GOFILE (opsional, tanpa token pun bisa)",
-            "pixeldrain": "API_KEY_PIXELDRAIN",
-            "filemirage": "API_TOKEN_FILEMIRAGE",
-            "player4me":  "API_KEY_PLAYER4ME",
-            "akirabox":   "API_KEY_AKIRABOX",
+            "gofile":     "API_TOKEN (opsional, tanpa token pun bisa)",
+            "pixeldrain": "API_KEY",
+            "filemirage": "API_TOKEN",
+            "player4me":  "API_TOKEN (dari player4me.com/account/api)",
+            "akirabox":   "API_KEY",
             "buzzheavier":"API_KEY (opsional)",
-            "transferit": "belum didukung",
+            "transferit": "tidak didukung saat ini",
         }
         hint = hints.get(host, "API_KEY")
         await message.reply(f"Gunakan: <code>/set{host} {hint}</code>")
@@ -342,10 +503,11 @@ async def set_api_key_cmd(_, message):
 @new_task
 async def multi_mirror_cmd(_, message):
     """
-    Terima 3 format input:
-    1. URL langsung:     /gofile https://server.com/file.mp4
-    2. Path lokal:       /gofile /app/downloads/namafile.mkv
-    3. Nama file saja:   /gofile namafile.mkv  (dicari otomatis di folder downloads)
+    3 mode input:
+    1. URL http/https  → download dulu lalu upload
+       Khusus player4me: pakai advance-upload (server p4m yang download)
+    2. Path absolut    → upload langsung dari path
+    3. Nama file       → cari di /app/downloads/ lalu upload
     """
     parts = message.text.strip().split(maxsplit=1)
     host  = parts[0].lstrip("/").lower()
@@ -356,27 +518,42 @@ async def multi_mirror_cmd(_, message):
         return
 
     if len(parts) < 2:
-        # Tampilkan help dengan contoh path lokal juga
         await message.reply(
             f"🔗 <b>Upload ke {host.capitalize()}</b>\n\n"
             f"<b>Cara 1</b> — Link langsung:\n"
             f"<code>/{host} https://example.com/file.mkv</code>\n\n"
             f"<b>Cara 2</b> — Path lokal (setelah mirror selesai):\n"
             f"<code>/{host} /app/downloads/namafile.mkv</code>\n\n"
-            f"<b>Cara 3</b> — Nama file saja (dicari di folder downloads):\n"
+            f"<b>Cara 3</b> — Nama file saja:\n"
             f"<code>/{host} namafile.mkv</code>"
         )
         return
 
-    arg        = parts[1].strip()
-    is_url     = arg.startswith(("http://", "https://"))
-    is_abspath = arg.startswith("/")
-    need_cleanup = False  # hapus file setelah upload hanya kalau kita yang download
-    dest       = None
+    arg      = parts[1].strip()
+    is_url   = arg.startswith(("http://", "https://"))
+    is_abs   = arg.startswith("/")
+    need_del = False
+    dest     = None
 
     status_msg = await message.reply("🔍 Memproses…")
 
-    # ── Case 1: URL → download dulu ──────────────────────────────────────────
+    # ── Player4me via advance-upload (URL → server p4m download) ─────────────
+    if host == "player4me" and is_url:
+        key = _API_KEYS.get("player4me", "")
+        if not key:
+            await status_msg.edit("❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN_ANDA")
+            return
+        await status_msg.edit(
+            f"📤 Mengirim URL ke server Player4me…\n"
+            f"(Server Player4me akan men-download filenya sendiri)\n"
+            f"<code>{arg}</code>"
+        )
+        fname = arg.split("/")[-1].split("?")[0].strip()
+        link = await to_thread(_p4m_advance_upload_url, arg, key, fname or None)
+        await status_msg.edit(f"✅ <b>Upload ke Player4me selesai!</b>\n\n🔗 {link}")
+        return
+
+    # ── Mode URL biasa → download dulu ───────────────────────────────────────
     if is_url:
         fname = arg.split("/")[-1].split("?")[0].strip()
         if not fname or len(fname) < 3:
@@ -388,42 +565,36 @@ async def multi_mirror_cmd(_, message):
         if not ok:
             await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
             return
-        need_cleanup = True
+        need_del = True
 
-    # ── Case 2: Path absolut ─────────────────────────────────────────────────
-    elif is_abspath:
+    # ── Mode path absolut ─────────────────────────────────────────────────────
+    elif is_abs:
         dest = arg
         if not os.path.exists(dest):
-            await status_msg.edit(
-                f"❌ File tidak ditemukan: <code>{dest}</code>\n\n"
-                f"Cek path dengan melihat isi folder:\n"
-                f"<code>/app/downloads/</code>"
-            )
+            await status_msg.edit(f"❌ File tidak ditemukan: <code>{dest}</code>")
             return
 
-    # ── Case 3: Nama file → cari di downloads ────────────────────────────────
+    # ── Mode nama file → cari di downloads ───────────────────────────────────
     else:
         await status_msg.edit(f"🔍 Mencari <code>{arg}</code> di folder downloads…")
         found = await to_thread(_find_file_in_downloads, arg)
         if not found:
-            # Tampilkan daftar file yang ada untuk membantu user
             files_list = []
             if os.path.isdir(DOWNLOAD_DIR):
                 for root, dirs, files in os.walk(DOWNLOAD_DIR):
-                    for f in files[:10]:  # max 10
+                    for f in files[:10]:
                         rel = os.path.relpath(os.path.join(root, f), DOWNLOAD_DIR)
                         files_list.append(rel)
             if files_list:
                 flist = "\n".join(f"• <code>{f}</code>" for f in files_list[:10])
                 await status_msg.edit(
                     f"❌ File <code>{arg}</code> tidak ditemukan.\n\n"
-                    f"File yang tersedia di downloads:\n{flist}\n\n"
-                    f"Gunakan nama file persis atau path lengkap."
+                    f"File tersedia di downloads:\n{flist}"
                 )
             else:
                 await status_msg.edit(
                     f"❌ File <code>{arg}</code> tidak ditemukan dan folder downloads kosong.\n"
-                    f"Gunakan <code>/mirror</code> terlebih dahulu untuk download file."
+                    f"Gunakan <code>/mirror</code> atau <code>/qbm</code> terlebih dahulu."
                 )
             return
         dest = found
@@ -438,8 +609,7 @@ async def multi_mirror_cmd(_, message):
     key  = _API_KEYS.get(host, "")
     link = await to_thread(func, dest, key)
 
-    # Cleanup hanya kalau kita yang download (bukan file milik mirror)
-    if need_cleanup:
+    if need_del:
         try:
             os.remove(dest)
         except Exception:
