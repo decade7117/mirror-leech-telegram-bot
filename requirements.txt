@@ -36,3 +36,4 @@ yt-dlp[default,curl-cffi]
 biliup
 qrcode[pil]
 pillow
+playwright
