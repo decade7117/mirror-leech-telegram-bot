@@ -32,8 +32,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-import qrcode
-from PIL import Image
 from pyrogram import filters
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import (
@@ -62,7 +60,7 @@ DEFAULT_SETTINGS = {
     "desc": "",
     "tid": 171,          # 171=游戏 160=生活 17=单机游戏
     "copyright": 1,      # 1=original 2=repost
-    "line": "kodo",
+    "line": "bda2",      # bda2=百度加速2 | tx=腾讯 | bldsa | alia=阿里
     "limit": 3,
     "account_mode": "round_robin",  # atau "all"
 }
@@ -116,158 +114,148 @@ def get_cookie_path(name: str) -> Path:
     return BILI_DIR / f"cookies_{name}.json"
 
 
-# ─────────────────────────────────────────────
-#  HELPER: QR CODE GAMBAR → Kirim ke Telegram
-# ─────────────────────────────────────────────
-
-async def send_qr(client, chat_id: int, url: str, caption: str) -> Message:
-    """Generate QR dari URL, kirim sebagai foto ke chat."""
-    qr = qrcode.QRCode(box_size=10, border=2)
-    qr.add_data(url)
-    qr.make(fit=True)
-    img: Image.Image = qr.make_image(fill_color="black", back_color="white")
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        img.save(tmp.name)
-        tmp_path = tmp.name
-
-    msg = await client.send_photo(chat_id, tmp_path, caption=caption)
-    os.unlink(tmp_path)
-    return msg
-
 
 # ─────────────────────────────────────────────
-#  PERINTAH: /bililogin
+#  PERINTAH: /bililogin — upload file cookies JSON
 # ─────────────────────────────────────────────
+#
+#  Cara pakai:
+#  1. Ketik /bililogin  → bot minta kirim file cookies
+#  2. Ketik /bililogin nama_akun  → bot minta kirim file, disimpan dengan nama itu
+#  3. Kirim file .json sebagai reply ke instruksi bot  → tersimpan otomatis
+#
+#  Format cookies yang didukung:
+#  - Format biliup: {"SESSDATA": "...", "bili_jct": "...", ...}
+#  - Format Netscape/array: [{"name": "SESSDATA", "value": "..."}, ...]
 
 @new_task
 async def bili_login_cmd(client, message: Message):
     user_id = message.from_user.id
 
-    # Batalkan sesi login sebelumnya jika ada
-    if user_id in _login_sessions:
-        old = _login_sessions.pop(user_id)
-        try:
-            old["proc"].kill()
-        except Exception:
-            pass
-
     args = message.text.split(maxsplit=1)
     akun_name = args[1].strip() if len(args) > 1 else next_account_name()
-    cookie_path = get_cookie_path(akun_name)
 
-    status_msg = await message.reply(
-        f"⏳ Memulai proses login untuk akun: <b>{akun_name}</b>\n"
-        "Tunggu sebentar, membuat QR code..."
-    )
-
-    # Jalankan biliup login dengan flag --qrcode (output URL ke stdout)
-    cmd = ["biliup", "-u", str(cookie_path), "login", "--qrcode"]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
+    # Simpan state menunggu file dari user ini
     _login_sessions[user_id] = {
-        "proc": proc,
-        "cookie_path": str(cookie_path),
         "akun_name": akun_name,
-        "status_msg": status_msg,
+        "waiting_file": True,
     }
 
-    # Baca baris output sampai ketemu URL QR
-    qr_url = None
-    try:
-        async with asyncio.timeout(30):
-            async for line in proc.stdout:
-                text = line.decode().strip()
-                LOGGER.info(f"[biliup login] {text}")
-                if text.startswith("http"):
-                    qr_url = text
-                    break
-    except asyncio.TimeoutError:
-        await status_msg.edit("❌ Timeout menunggu QR code dari biliup.")
-        proc.kill()
-        _login_sessions.pop(user_id, None)
-        return
-
-    if not qr_url:
-        stderr = await proc.stderr.read()
-        await status_msg.edit(
-            f"❌ Gagal mendapatkan QR URL.\n<code>{stderr.decode()[:300]}</code>"
-        )
-        _login_sessions.pop(user_id, None)
-        return
-
-    # Kirim QR code ke user
-    await status_msg.delete()
-    qr_msg = await send_qr(
-        client,
-        message.chat.id,
-        qr_url,
-        caption=(
-            f"📱 <b>Scan QR ini dengan aplikasi Bilibili</b>\n\n"
-            f"👤 Akun: <b>{akun_name}</b>\n"
-            f"⏱ QR berlaku ~3 menit\n\n"
-            "Buka Bilibili → Profil → Pindai QR Code\n"
-            "Bot akan otomatis konfirmasi setelah scan."
-        ),
+    await message.reply(
+        f"📂 <b>Upload Cookies Bilibili</b>\n\n"
+        f"👤 Akun yang akan didaftarkan: <b>{akun_name}</b>\n\n"
+        "Kirim file <code>cookies.json</code> kamu sekarang.\n\n"
+        "<b>Cara dapatkan cookies:</b>\n"
+        "• Gunakan ekstensi browser <b>EditThisCookie</b> atau <b>Cookie-Editor</b>\n"
+        "• Login ke bilibili.com → Export cookies sebagai JSON\n"
+        "• Kirim file .json tersebut ke sini\n\n"
+        "<b>Format yang didukung:</b>\n"
+        "• Format biliup: <code>{\"SESSDATA\": \"...\", \"bili_jct\": \"...\"}</code>\n"
+        "• Format array: <code>[{\"name\": \"SESSDATA\", \"value\": \"...\"}]</code>\n\n"
+        "⏱ Menunggu file selama 5 menit...\n"
+        "Ketik /bilicancel untuk batalkan."
     )
 
-    _login_sessions[user_id]["qr_msg"] = qr_msg
-
-    # Tunggu proses biliup selesai (login berhasil = exit 0)
+    # Auto-expire session setelah 5 menit
     asyncio.get_event_loop().create_task(
-        _wait_login_result(client, user_id, message.chat.id)
+        _expire_login_session(user_id, client, message.chat.id)
     )
 
 
-async def _wait_login_result(client, user_id: int, chat_id: int):
+async def _expire_login_session(user_id: int, client, chat_id: int):
+    await asyncio.sleep(300)  # 5 menit
     session = _login_sessions.get(user_id)
-    if not session:
-        return
-
-    proc = session["proc"]
-    akun_name = session["akun_name"]
-    cookie_path = session["cookie_path"]
-    qr_msg = session.get("qr_msg")
-
-    try:
-        # Tunggu max 3 menit
-        await asyncio.wait_for(proc.wait(), timeout=180)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await client.send_message(chat_id, f"❌ Login timeout untuk akun <b>{akun_name}</b>.")
+    if session and session.get("waiting_file"):
         _login_sessions.pop(user_id, None)
+        await client.send_message(
+            chat_id,
+            "⏱ Sesi login timeout. Ketik /bililogin untuk coba lagi."
+        )
+
+
+@new_task
+async def bili_receive_cookie_file(client, message: Message):
+    """Handler untuk menerima file cookies JSON yang dikirim user."""
+    user_id = message.from_user.id
+    session = _login_sessions.get(user_id)
+
+    if not session or not session.get("waiting_file"):
+        return  # Bukan dalam sesi login, abaikan
+
+    doc = message.document
+    if not doc:
+        await message.reply("❌ Kirim sebagai file/dokumen, bukan foto atau teks.")
         return
 
+    filename = doc.file_name or ""
+    if not filename.endswith(".json"):
+        await message.reply(
+            "❌ File harus berformat <code>.json</code>\n"
+            "Pastikan kamu export cookies sebagai JSON."
+        )
+        return
+
+    akun_name = session["akun_name"]
+    cookie_path = get_cookie_path(akun_name)
+
+    status_msg = await message.reply(f"⏳ Memproses cookies untuk akun <b>{akun_name}</b>...")
+
+    # Download file dari Telegram
+    tmp_path = f"/tmp/cookies_upload_{user_id}.json"
+    await client.download_media(message, file_name=tmp_path)
+
+    # Validasi dan konversi format cookies
+    try:
+        raw = Path(tmp_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception as e:
+        await status_msg.edit(f"❌ File JSON tidak valid:\n<code>{e}</code>")
+        _login_sessions.pop(user_id, None)
+        os.unlink(tmp_path)
+        return
+
+    # Konversi format array (Netscape/browser export) → dict
+    if isinstance(data, list):
+        converted = {}
+        for item in data:
+            if isinstance(item, dict) and "name" in item and "value" in item:
+                converted[item["name"]] = item["value"]
+        if not converted:
+            await status_msg.edit(
+                "❌ Format cookies array tidak dikenali.\n"
+                "Pastikan setiap item punya field <code>name</code> dan <code>value</code>."
+            )
+            _login_sessions.pop(user_id, None)
+            os.unlink(tmp_path)
+            return
+        data = converted
+
+    # Validasi minimal ada SESSDATA
+    required_keys = {"SESSDATA", "bili_jct"}
+    found_keys = set(data.keys())
+    missing = required_keys - found_keys
+    if missing:
+        await status_msg.edit(
+            f"⚠️ Cookies kurang lengkap, key yang tidak ditemukan: <code>{', '.join(missing)}</code>\n\n"
+            "Tetap disimpan, tapi mungkin tidak bisa upload.\n"
+            "Pastikan kamu login dulu di bilibili.com sebelum export."
+        )
+
+    # Simpan cookies
+    cookie_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    os.unlink(tmp_path)
     _login_sessions.pop(user_id, None)
 
-    if proc.returncode == 0 and Path(cookie_path).exists():
-        # Hapus QR code lama
-        if qr_msg:
-            try:
-                await qr_msg.delete()
-            except Exception:
-                pass
-
-        accounts = list_accounts()
-        await client.send_message(
-            chat_id,
-            f"✅ <b>Login Berhasil!</b>\n\n"
-            f"👤 Akun: <b>{akun_name}</b>\n"
-            f"💾 Cookie: <code>{cookie_path}</code>\n"
-            f"📊 Total akun terdaftar: <b>{len(accounts)}</b>\n\n"
-            "Gunakan /biliaccounts untuk lihat semua akun.",
-        )
-    else:
-        stderr = await proc.stderr.read()
-        await client.send_message(
-            chat_id,
-            f"❌ Login gagal untuk akun <b>{akun_name}</b>\n"
-            f"<code>{stderr.decode()[:300]}</code>",
-        )
+    accounts = list_accounts()
+    await status_msg.edit(
+        f"✅ <b>Cookies berhasil disimpan!</b>\n\n"
+        f"👤 Akun: <b>{akun_name}</b>\n"
+        f"💾 Path: <code>{cookie_path}</code>\n"
+        f"🔑 Keys: <code>{', '.join(sorted(data.keys()))}</code>\n"
+        f"📊 Total akun terdaftar: <b>{len(accounts)}</b>\n\n"
+        "Gunakan /biliaccounts untuk lihat semua akun.\n"
+        "Gunakan /biliupload untuk mulai upload video."
+    )
 
 
 # ─────────────────────────────────────────────
@@ -461,25 +449,49 @@ def _do_upload(
     settings: dict,
     desc_override: str = None,
 ):
-    """Eksekusi biliup upload secara sinkron (dijalankan di thread)."""
+    """
+    Eksekusi biliup upload secara sinkron (dijalankan di thread).
+    Syntax biliup-cli 1.1.29:
+      biliup -u <cookie> upload <file> --title "..." --tag "..." ...
+    Catatan: -u (--user-cookie) adalah flag GLOBAL, harus sebelum subcommand 'upload'.
+    """
     desc = desc_override if desc_override is not None else settings.get("desc", "")
+
+    # Tentukan line — biliup-cli 1.1.29 hanya support nilai tertentu
+    # default pakai "bda2" jika setting tidak valid
+    valid_lines = {
+        "bldsa", "cnbldsa", "andsa", "atdsa",
+        "bda2", "cnbd", "anbd", "atbd",
+        "tx", "cntx", "antx", "attx",
+        "bda", "txa", "alia",
+    }
+    line = settings.get("line", "bda2")
+    if line not in valid_lines:
+        line = "bda2"
+
     cmd = [
-        "biliup", "upload",
+        "biliup",
+        "-u", account["path"],      # --user-cookie HARUS sebelum subcommand
+        "upload",
         video_path,
-        "--user-cookie", account["path"],
-        "--title", title,
+        "--title", title or Path(video_path).stem,
         "--desc", desc,
         "--tid", str(settings.get("tid", 171)),
         "--tag", tags,
         "--copyright", str(settings.get("copyright", 1)),
-        "--line", settings.get("line", "kodo"),
+        "--line", line,
         "--limit", str(settings.get("limit", 3)),
     ]
+
+    LOGGER.info(f"[biliup upload] cmd: {' '.join(cmd)}")
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        LOGGER.info(f"[biliup upload] stdout: {result.stdout[:200]}")
         if result.returncode == 0:
-            return True, "Upload berhasil!"
-        return False, result.stderr[:200] or "Exit non-zero"
+            return True, "Upload berhasil! ✅"
+        err = result.stderr[:300] or result.stdout[:300] or "Exit non-zero"
+        return False, err
     except subprocess.TimeoutExpired:
         return False, "Timeout (>1 jam)"
     except Exception as e:
@@ -664,6 +676,20 @@ async def bili_callback(client, query: CallbackQuery):
 
 
 # ─────────────────────────────────────────────
+#  PERINTAH: /bilicancel — batalkan sesi login
+# ─────────────────────────────────────────────
+
+@new_task
+async def bili_cancel_login_cmd(client, message: Message):
+    user_id = message.from_user.id
+    if user_id in _login_sessions:
+        _login_sessions.pop(user_id)
+        await message.reply("✅ Sesi login dibatalkan.")
+    else:
+        await message.reply("Tidak ada sesi login yang aktif.")
+
+
+# ─────────────────────────────────────────────
 #  REGISTRASI HANDLER — otomatis saat module di-import
 # ─────────────────────────────────────────────
 
@@ -671,6 +697,12 @@ TgClient.bot.add_handler(
     MessageHandler(
         bili_login_cmd,
         filters=filters.command("bililogin") & CustomFilters.authorized,
+    )
+)
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_cancel_login_cmd,
+        filters=filters.command("bilicancel") & CustomFilters.authorized,
     )
 )
 TgClient.bot.add_handler(
@@ -701,6 +733,13 @@ TgClient.bot.add_handler(
     CallbackQueryHandler(
         bili_callback,
         filters=filters.regex(r"^bili_"),
+    )
+)
+# Handler penerima file cookies — tangkap dokumen .json dari user yang sedang dalam sesi login
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_receive_cookie_file,
+        filters=filters.document & CustomFilters.authorized,
     )
 )
 
