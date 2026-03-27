@@ -57,7 +57,7 @@ DEFAULT_SETTINGS = {
     "tags": ["indonesia", "gaming", "anime"],
     "title_prefix": "",
     "desc": "",
-    "tid": 171,          # 171=游戏 160=生活 17=单机游戏
+    "tid": 171,          # 171=游戏 160=生活 17=单机游戏 (Catatan: Bilibili TV mungkin beda ID)
     "copyright": 1,      # 1=original 2=repost
     "line": "bda2",      # bda2=百度加速2 | tx=腾讯 | bldsa | alia=阿里
     "limit": 3,
@@ -117,15 +117,6 @@ def get_cookie_path(name: str) -> Path:
 # ─────────────────────────────────────────────
 #  PERINTAH: /bililogin — upload file cookies JSON
 # ─────────────────────────────────────────────
-#
-#  Cara pakai:
-#  1. Ketik /bililogin  → bot minta kirim file cookies
-#  2. Ketik /bililogin nama_akun  → bot minta kirim file, disimpan dengan nama itu
-#  3. Kirim file .json sebagai reply ke instruksi bot  → tersimpan otomatis
-#
-#  Format cookies yang didukung:
-#  - Format biliup: {"SESSDATA": "...", "bili_jct": "...", ...}
-#  - Format Netscape/array: [{"name": "SESSDATA", "value": "..."}, ...]
 
 @new_task
 async def bili_login_cmd(client, message: Message):
@@ -461,6 +452,7 @@ async def _do_upload_playwright(
     title: str,
     tags: str,
     desc: str,
+    tid: int,  # Ditambahkan parameter tid
 ) -> tuple[bool, str]:
     """
     Upload video ke bilibili.tv via pure API (tanpa browser).
@@ -470,7 +462,7 @@ async def _do_upload_playwright(
       2. POST {upload_url}?uploads       → inisiasi multipart upload
       3. PUT  chunks                     → upload file per bagian
       4. POST {upload_url}?output=json   → complete multipart upload
-      5. POST api.bilibili.tv/x/vu/web/add/v3  → submit metadata
+      5. POST api.bilibili.tv/intl/videoup/web2/add  → submit metadata
     """
     import httpx
 
@@ -647,7 +639,7 @@ async def _do_upload_playwright(
             return False, f"Complete upload error: {complete_data}"
 
         # ── Step 6: Submit metadata ───────────────────────────
-        LOGGER.info(f"[bili.tv] Step 6: submit metadata — judul: {title}")
+        LOGGER.info(f"[bili.tv] Step 6: submit metadata — judul: {title} | tid: {tid}")
         tags_list = [t.strip() for t in tags.split(",") if t.strip()]
 
         # filename key dari complete response, fallback ke nama file
@@ -661,7 +653,7 @@ async def _do_upload_playwright(
                 "desc":     desc,
             }],
             "source":     "",
-            "tid":        0,
+            "tid":        tid,  # Menggunakan parameter dinamis dari setting
             "cover":      "//p.bstarstatic.com/ugc/262ec39c213a1a6493b36826f2ff9a82.jpg",
             "title":      title,
             "tag":        ",".join(tags_list),
@@ -706,7 +698,7 @@ async def bili_upload_cmd(client, message: Message):
     Format perintah:
       /biliupload <url>
       /biliupload <url> | <judul>
-      /biliupload <url> | <deskripsi>
+      /biliupload <url> | <judul> | <deskripsi>
 
     Contoh:
       /biliupload https://example.com/video.mp4
@@ -767,6 +759,7 @@ async def bili_upload_cmd(client, message: Message):
     desc      = custom_desc or settings.get("desc", "")
     tags_str  = ",".join(settings.get("tags", []))
     mode      = settings.get("account_mode", "round_robin")
+    tid_val   = settings.get("tid", 171)  # Ambil nilai tid dari settings
     valid_accs = [a for a in accounts if a["valid"]]
 
     if not valid_accs:
@@ -794,7 +787,7 @@ async def bili_upload_cmd(client, message: Message):
         f"📄 Deskripsi: {desc[:80] or '(default)'}\n"
         f"🏷 Tags: {tags_display}\n"
         f"👥 Akun: {', '.join(a['name'] for a in target_accounts)}\n"
-        f"📁 Kategori: tid={settings.get('tid', 171)}"
+        f"📁 Kategori: tid={tid_val}"
     )
 
     # Download dulu ke /tmp
@@ -822,7 +815,7 @@ async def bili_upload_cmd(client, message: Message):
                 "Jangan kirim perintah lain dulu."
             )
             ok, detail = await _do_upload_playwright(
-                video_path, acc, title, tags_str, desc
+                video_path, acc, title, tags_str, desc, tid_val
             )
             emoji = "✅" if ok else "❌"
             results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
