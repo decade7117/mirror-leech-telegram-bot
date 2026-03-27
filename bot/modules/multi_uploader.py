@@ -203,7 +203,7 @@ def _download_from_url(url: str) -> tuple[str | None, str | None]:
     except Exception as e:
         return None, str(e)
 
-async def _do_upload_playwright(video_path: str, account: dict, title: str, tags: str, desc: str) -> tuple[bool, str]:
+async def _do_upload_playwright(video_path: str, account: dict, title: str, tags: str, desc: str, custom_cover: str = None) -> tuple[bool, str]:
     import httpx
     try:
         cookies = json.loads(Path(account["path"]).read_text())
@@ -221,6 +221,8 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
         "Referer": "https://studio.bilibili.tv/",
         "Cookie": cookie_header,
     }
+
+    CHUNK_SIZE = 10 * 1024 * 1024
 
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
         # 1. Preupload
@@ -241,7 +243,6 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
         upload_id = r.json().get("upload_id") or r.json().get("uploadId")
 
         # 3. Chunks
-        CHUNK_SIZE = 10 * 1024 * 1024
         total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
         parts = []
         with open(video_path, "rb") as f:
@@ -262,7 +263,7 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
         r = await client.post(upload_url, params={"output": "json", "name": filename, "profile": "iup/bup", "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")), "biz": "UGC"}, json={"parts": parts}, headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"}, timeout=60)
         complete_data = r.json()
 
-        # 5. Submit (100% IDENTIK DENGAN CURL BROWSER)
+        # 5. Submit
         video_key = complete_data.get("key", "").strip("/")
         filename_only = video_key.replace(".mp4", "")
 
@@ -275,9 +276,12 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
             "csrf": cookies.get("bili_jct", "") or cookies.get("joy_jct", "")
         }
 
+        # Gunakan custom cover jika ada, jika tidak pakai cover default fallback
+        final_cover = custom_cover if custom_cover else "https://p.bstarstatic.com/ugc/a81bfcb06c220955768404166a1f856b.jpg"
+
         submit_data = {
             "title": title[:80],
-            "cover": "https://p.bstarstatic.com/ugc/a81bfcb06c220955768404166a1f856b.jpg",
+            "cover": final_cover,
             "desc": desc,
             "no_reprint": True,
             "filename": filename_only,
@@ -306,32 +310,65 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
 
 @new_task
 async def bili_upload_cmd(client, message: Message):
+    """
+    Format: /biliupload <url_video> | <judul> | <deskripsi> | <url_cover>
+    
+    Contoh:
+    /biliupload https://test.com/vid.mp4 | Eps 1 | Desc | https://blogger.com/img.png
+    """
     accounts = [a for a in list_accounts() if a["valid"]]
     if not accounts: return await message.reply("❌ Belum ada akun Bilibili valid!")
 
     settings = load_settings()
     args = message.text.split(maxsplit=1)
-    if len(args) < 2: return await message.reply("❌ Format: <code>/biliupload &lt;url&gt; | &lt;judul&gt; | &lt;deskripsi&gt;</code>")
+    if len(args) < 2: return await message.reply("❌ Format: <code>/biliupload &lt;url_video&gt; | &lt;judul&gt; | &lt;deskripsi&gt; | &lt;url_cover&gt;</code>")
 
+    # Parsing argumen dengan pemisah "|"
     parts = [p.strip() for p in args[1].strip().split("|")]
-    url = parts[0]
-    title = (parts[1] if len(parts) > 1 and parts[1] else url.rstrip("/").split("/")[-1].split("?")[0]).replace(".mp4", "")
-    desc = parts[2] if len(parts) > 2 and parts[2] else settings.get("desc", "")
     
+    url = parts[0]
+    custom_title = parts[1] if len(parts) > 1 and parts[1] else None
+    custom_desc  = parts[2] if len(parts) > 2 and parts[2] else None
+    custom_cover = parts[3] if len(parts) > 3 and parts[3] else None
+
+    if not url.startswith("http"):
+        await message.reply("❌ URL video tidak valid.")
+        return
+
+    url_filename = url.rstrip("/").split("/")[-1].split("?")[0]
+    url_stem = url_filename.rsplit(".", 1)[0] if "." in url_filename else url_filename
+
+    title = custom_title or url_stem
     if settings.get("title_prefix"): title = f"{settings['title_prefix']} {title}"
+
+    desc = custom_desc or settings.get("desc", "")
     tags_str = ",".join(settings.get("tags", []))
+    valid_accs = [a for a in accounts if a["valid"]]
 
-    targets = accounts if settings.get("account_mode") == "all" else [accounts[int(time.time()) % len(accounts)]]
+    if not valid_accs:
+        await message.reply("❌ Semua cookie tidak valid. Login ulang.")
+        return
 
-    status_msg = await message.reply(f"⬇️ <b>Mendownload video...</b>\n📝 {title}")
+    if settings.get("account_mode", "round_robin") == "all":
+        target_accounts = valid_accs
+    else:
+        target_accounts = [valid_accs[int(time.time()) % len(valid_accs)]]
+
+    status_msg = await message.reply(
+        f"⬇️ <b>Mendownload video...</b>\n\n"
+        f"📝 Judul: {title}\n"
+        f"🖼 Cover: {'Custom URL' if custom_cover else 'Default'}"
+    )
+    
     video_path, err = await asyncio.to_thread(_download_from_url, url)
     if not video_path: return await status_msg.edit(f"❌ <b>Download gagal:</b> {err}")
 
     results = []
     try:
-        for acc in targets:
+        for acc in target_accounts:
             await status_msg.edit(f"🚀 <b>Upload ke BiliTV...</b>\n👤 Akun: <b>{acc['name']}</b>")
-            ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc)
+            # Mengirim parameter custom_cover ke fungsi eksekutor
+            ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover)
             results.append(f"{'✅' if ok else '❌'} <b>{acc['name']}</b>: {detail}")
     finally:
         if video_path and os.path.exists(video_path): os.unlink(video_path)
