@@ -57,7 +57,7 @@ DEFAULT_SETTINGS = {
     "tags": ["indonesia", "gaming", "anime"],
     "title_prefix": "",
     "desc": "",
-    "tid": 171,          # (Hanya berlaku untuk bilibili.com, untuk bilibili.tv akan diabaikan)
+    "tid": 171,          # (Akan diabaikan saat upload karena Bilibili TV tidak pakai ini)
     "copyright": 1,      # 1=original 2=repost
     "line": "bda2",      # bda2=百度加速2 | tx=腾讯 | bldsa | alia=阿里
     "limit": 3,
@@ -272,7 +272,6 @@ async def bili_accounts_cmd(client, message: Message):
     tags_str = ", ".join(f"#{t}" for t in settings.get("tags", []))
     lines.append(f"\n🏷 Tags: {tags_str or '-'}")
     lines.append(f"🔄 Mode: {settings.get('account_mode', 'round_robin')}")
-    lines.append(f"📁 Kategori tid: {settings.get('tid', 171)}")
     lines.append("\nGunakan /bililogout [nama] untuk hapus akun.")
 
     buttons = [
@@ -314,14 +313,13 @@ async def bili_logout_cmd(client, message: Message):
 
 
 # ─────────────────────────────────────────────
-#  PERINTAH: /biliset — atur tags, tid, mode
+#  PERINTAH: /biliset — atur tags, mode
 # ─────────────────────────────────────────────
 
 @new_task
 async def bili_set_cmd(client, message: Message):
     """
     /biliset tags gaming,anime,indonesia
-    /biliset tid 171
     /biliset mode all
     /biliset mode round_robin
     /biliset prefix [AUTO]
@@ -335,20 +333,15 @@ async def bili_set_cmd(client, message: Message):
         await message.reply(
             "<b>⚙️ Pengaturan Bilibili Uploader</b>\n\n"
             f"🏷 Tags: <code>{tags_str}</code>\n"
-            f"📁 tid: <code>{settings.get('tid', 171)}</code>\n"
             f"🔄 Mode: <code>{settings.get('account_mode', 'round_robin')}</code>\n"
             f"🔤 Prefix: <code>{settings.get('title_prefix', '')}</code>\n"
             f"📝 Desc: <code>{settings.get('desc', '')}</code>\n\n"
             "<b>Cara pakai:</b>\n"
             "/biliset tags gaming,anime,indonesia\n"
-            "/biliset tid 171\n"
             "/biliset mode all\n"
             "/biliset mode round_robin\n"
             "/biliset prefix [AUTO]\n"
             "/biliset desc Deskripsi default\n\n"
-            "<b>Kategori tid umum:</b>\n"
-            "171=游戏  160=生活  17=单机游戏\n"
-            "21=日常  138=搞笑  189=其他"
         )
         return
 
@@ -361,14 +354,6 @@ async def bili_set_cmd(client, message: Message):
         save_settings(settings)
         tags_display = " ".join(f"#{t}" for t in tags)
         await message.reply(f"✅ Tags diset: {tags_display}")
-
-    elif key == "tid":
-        try:
-            settings["tid"] = int(val)
-            save_settings(settings)
-            await message.reply(f"✅ Kategori tid diset ke: {val}")
-        except ValueError:
-            await message.reply("❌ tid harus angka, contoh: /biliset tid 171")
 
     elif key == "mode":
         if val not in ("all", "round_robin"):
@@ -389,7 +374,7 @@ async def bili_set_cmd(client, message: Message):
         await message.reply(f"✅ Deskripsi default diset ke: {val}")
 
     else:
-        await message.reply(f"❌ Key tidak dikenal: {key}")
+        await message.reply(f"❌ Key tidak dikenal: {key} (Catatan: tid tidak digunakan di Bili TV)")
 
 
 # ─────────────────────────────────────────────
@@ -455,13 +440,6 @@ async def _do_upload_playwright(
 ) -> tuple[bool, str]:
     """
     Upload video ke bilibili.tv via pure API (tanpa browser).
-
-    Flow:
-      1. GET  api.bilibili.tv/preupload  → dapat upload_url, upload_id, upos_auth
-      2. POST {upload_url}?uploads       → inisiasi multipart upload
-      3. PUT  chunks                     → upload file per bagian
-      4. POST {upload_url}?output=json   → complete multipart upload
-      5. POST api.bilibili.tv/intl/videoup/web2/add  → submit metadata
     """
     import httpx
 
@@ -514,19 +492,13 @@ async def _do_upload_playwright(
         if pre.get("OK") != 1:
             return False, f"Preupload error: {pre}"
 
-        # Gabungkan endpoint dengan path dari upos_uri
         endpoint = pre.get("endpoint", "")
         upos_uri = pre.get("upos_uri", "")
-        
-        # ubah format upos://iupever/xxx.mp4 menjadi /iupever/xxx.mp4
         url_path = upos_uri.replace("upos://", "/")
         upload_url = endpoint + url_path
-        
-        # X-Upos-Auth menggunakan value dari key 'auth'
         upos_auth = pre.get("auth", "")
         biz_id = str(pre.get("biz_id", ""))
 
-        # Normalisasi URL
         if upload_url.startswith("//"):
             upload_url = "https:" + upload_url
 
@@ -641,11 +613,10 @@ async def _do_upload_playwright(
         LOGGER.info(f"[bili.tv] Step 6: submit metadata — judul: {title}")
         tags_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-        # filename key dari complete response, fallback ke nama file
         video_key = complete_data.get("key", "").lstrip("/") or filename
 
         # PAYLOAD KHUSUS BILIBILI TV (Internasional)
-        # Tidak menggunakan parameter tid (kategori) karena Bili TV tidak memiliki partisi
+        # Sesuai dengan form di UI: Tidak ada TID, cover wajib HTTPS, no_reprint wajib 1, tags format list
         submit_data = {
             "copyright": 1,
             "videos": [{
@@ -654,13 +625,12 @@ async def _do_upload_playwright(
                 "desc":     desc,
             }],
             "source":     "",
-            "tid":        0,  # <-- Kunci paksa ke 0, sangat krusial untuk Bilibili TV
-            "cover":      "//p.bstarstatic.com/ugc/262ec39c213a1a6493b36826f2ff9a82.jpg",
+            "cover":      "https://p.bstarstatic.com/ugc/262ec39c213a1a6493b36826f2ff9a82.jpg",
             "title":      title,
-            "tag":        ",".join(tags_list),
+            "tag":        ",".join(tags_list),  # Fallback untuk backward compatibility
+            "tags":       tags_list,            # Format array untuk API baru
             "desc":       desc,
-            "dynamic":    "",
-            "no_reprint": 0,
+            "no_reprint": 1,                    # Karena "Repost is prohibited" dicentang
         }
 
         try:
@@ -699,15 +669,6 @@ async def bili_upload_cmd(client, message: Message):
       /biliupload <url>
       /biliupload <url> | <judul>
       /biliupload <url> | <judul> | <deskripsi>
-
-    Contoh:
-      /biliupload https://example.com/video.mp4
-      /biliupload https://example.com/video.mp4 | Hidori Stream Eps 12
-      /biliupload https://example.com/video.mp4 | Hidori Stream Eps 12 | Episode 12 HD sub indo
-
-    Catatan:
-      - Judul & deskripsi opsional, jika tidak diisi pakai default dari /biliset
-      - Separator antar bagian menggunakan | (pipe)
     """
     accounts = list_accounts()
     if not accounts:
@@ -732,7 +693,6 @@ async def bili_upload_cmd(client, message: Message):
         )
         return
 
-    # Parse URL | judul | deskripsi
     raw = args[1].strip()
     parts = [p.strip() for p in raw.split("|")]
 
@@ -740,7 +700,6 @@ async def bili_upload_cmd(client, message: Message):
     custom_title = parts[1] if len(parts) > 1 and parts[1] else None
     custom_desc  = parts[2] if len(parts) > 2 and parts[2] else None
 
-    # Validasi URL
     if not url.startswith("http://") and not url.startswith("https://"):
         await message.reply(
             "❌ URL tidak valid.\n"
@@ -748,7 +707,6 @@ async def bili_upload_cmd(client, message: Message):
         )
         return
 
-    # Ambil nama file dari URL sebagai judul fallback
     url_filename = url.rstrip("/").split("/")[-1].split("?")[0]
     url_stem = url_filename.rsplit(".", 1)[0] if "." in url_filename else url_filename
 
@@ -768,11 +726,9 @@ async def bili_upload_cmd(client, message: Message):
         )
         return
 
-    # Pilih akun
     if mode == "all":
         target_accounts = valid_accs
     else:
-        # Round robin sederhana berdasarkan waktu
         idx = int(time.time()) % len(valid_accs)
         target_accounts = [valid_accs[idx]]
 
@@ -785,11 +741,9 @@ async def bili_upload_cmd(client, message: Message):
         f"📝 Judul: {title}\n"
         f"📄 Deskripsi: {desc[:80] or '(default)'}\n"
         f"🏷 Tags: {tags_display}\n"
-        f"👥 Akun: {', '.join(a['name'] for a in target_accounts)}\n"
-        f"📁 (Kategori diabaikan untuk Bilibili TV)"
+        f"👥 Akun: {', '.join(a['name'] for a in target_accounts)}"
     )
 
-    # Download dulu ke /tmp
     video_path, err = await asyncio.to_thread(_download_from_url, url)
     if not video_path:
         await status_msg.edit(
@@ -801,7 +755,6 @@ async def bili_upload_cmd(client, message: Message):
 
     file_size_mb = round(Path(video_path).stat().st_size / 1024 / 1024, 1)
 
-    # Pakai try/finally supaya file SELALU dihapus apapun yang terjadi
     results = []
     try:
         for acc in target_accounts:
@@ -819,7 +772,6 @@ async def bili_upload_cmd(client, message: Message):
             emoji = "✅" if ok else "❌"
             results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
     finally:
-        # SELALU hapus file temp, sukses atau gagal atau crash sekalipun
         try:
             if video_path and os.path.exists(video_path):
                 os.unlink(video_path)
@@ -859,7 +811,6 @@ async def bili_callback(client, query: CallbackQuery):
         await query.message.reply(
             f"<b>⚙️ Pengaturan saat ini:</b>\n\n"
             f"🏷 Tags: <code>{tags_str}</code>\n"
-            f"📁 tid: <code>{settings.get('tid')}</code>\n"
             f"🔄 Mode: <code>{settings.get('account_mode')}</code>\n"
             f"🔤 Prefix: <code>{settings.get('title_prefix') or '-'}</code>\n"
             f"📝 Desc: <code>{settings.get('desc') or '-'}</code>\n\n"
@@ -927,7 +878,6 @@ TgClient.bot.add_handler(
         filters=filters.regex(r"^bili_"),
     )
 )
-# Handler penerima file cookies — tangkap dokumen .json dari user yang sedang dalam sesi login
 TgClient.bot.add_handler(
     MessageHandler(
         bili_receive_cookie_file,
