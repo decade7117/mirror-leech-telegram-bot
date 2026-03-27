@@ -1,26 +1,26 @@
 """
 ============================================================
-  bot/modules/bilibili_login.py
-  Tambahkan ke folder: bot/modules/
+ bot/modules/bilibili_login.py
+ Tambahkan ke folder: bot/modules/
 
-  FITUR:
-  - /bililogin      → simpan cookies bilibili.tv (upload file JSON)
-  - /biliaccounts   → lihat semua akun yang sudah login
-  - /bililogout     → logout / hapus akun
-  - /biliupload     → upload video via direct URL ke bilibili.tv
-  - /biliset        → atur default tags, judul, deskripsi
-  - /bilicancel     → batalkan sesi login yang aktif
+ FITUR:
+ - /bililogin      → simpan cookies bilibili.tv (upload file JSON)
+ - /biliaccounts   → lihat semua akun yang sudah login
+ - /bililogout     → logout / hapus akun
+ - /biliupload     → upload video via direct URL ke bilibili.tv
+ - /biliset        → atur default tags, judul, deskripsi
+ - /bilicancel     → batalkan sesi login yang aktif
 
-  FORMAT /biliupload:
-  /biliupload <url> | <judul> | <deskripsi>
-  /biliupload <url> | <judul>
-  /biliupload <url>
+ FORMAT /biliupload:
+ /biliupload <url> | <judul> | <deskripsi>
+ /biliupload <url> | <judul>
+ /biliupload <url>
 
-  Contoh:
-  /biliupload https://example.com/video.mp4 | Hidori Eps 12 | Episode 12 HD sub indo
+ Contoh:
+ /biliupload https://example.com/video.mp4 | Hidori Eps 12 | Episode 12 HD sub indo
 
-  INSTALL DEPENDENCY:
-  pip install httpx
+ INSTALL DEPENDENCY:
+ pip install httpx
 ============================================================
 """
 
@@ -523,9 +523,17 @@ async def _do_upload_playwright(
         if pre.get("OK") != 1:
             return False, f"Preupload error: {pre}"
 
-        upload_url   = pre["url"]           # e.g. //upos-cs-upcdntxa.bilivideo.com/iupever/nXXX.mp4
-        upos_auth    = pre["upos_uri"]      # X-Upos-Auth header value
-        biz_id       = str(pre.get("biz_id", ""))
+        # Gabungkan endpoint dengan path dari upos_uri
+        endpoint = pre.get("endpoint", "")
+        upos_uri = pre.get("upos_uri", "")
+        
+        # ubah format upos://iupever/xxx.mp4 menjadi /iupever/xxx.mp4
+        url_path = upos_uri.replace("upos://", "/")
+        upload_url = endpoint + url_path
+        
+        # X-Upos-Auth menggunakan value dari key 'auth'
+        upos_auth = pre.get("auth", "")
+        biz_id = str(pre.get("biz_id", ""))
 
         # Normalisasi URL
         if upload_url.startswith("//"):
