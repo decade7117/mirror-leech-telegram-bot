@@ -4,11 +4,12 @@
   Tambahkan ke folder: bot/modules/
 
   FITUR:
-  - /bililogin      → login akun baru via QR code (scan HP)
+  - /bililogin      → simpan cookies bilibili.tv (upload file JSON)
   - /biliaccounts   → lihat semua akun yang sudah login
   - /bililogout     → logout / hapus akun
-  - /biliupload     → upload video via direct URL ke Bilibili
-  - /biliset        → atur default tags, judul, kategori
+  - /biliupload     → upload video via direct URL ke bilibili.tv
+  - /biliset        → atur default tags, judul, deskripsi
+  - /bilicancel     → batalkan sesi login yang aktif
 
   FORMAT /biliupload:
   /biliupload <url> | <judul> | <deskripsi>
@@ -19,15 +20,14 @@
   /biliupload https://example.com/video.mp4 | Hidori Eps 12 | Episode 12 HD sub indo
 
   INSTALL DEPENDENCY:
-  pip install biliup qrcode[pil] pillow
+  pip install playwright
+  playwright install chromium
 ============================================================
 """
 
 import asyncio
 import json
 import os
-import subprocess
-import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -441,61 +441,196 @@ def _download_from_url(url: str) -> tuple[str | None, str | None]:
 #  HELPER: EKSEKUSI UPLOAD
 # ─────────────────────────────────────────────
 
-def _do_upload(
+async def _do_upload_playwright(
     video_path: str,
     account: dict,
     title: str,
     tags: str,
-    settings: dict,
-    desc_override: str = None,
-):
+    desc: str,
+) -> tuple[bool, str]:
     """
-    Eksekusi biliup upload secara sinkron (dijalankan di thread).
-    Syntax biliup-cli 1.1.29:
-      biliup -u <cookie> upload <file> --title "..." --tag "..." ...
-    Catatan: -u (--user-cookie) adalah flag GLOBAL, harus sebelum subcommand 'upload'.
+    Upload video ke studio.bilibili.tv menggunakan Playwright.
+    Inject cookies dari file JSON → buka studio → upload via file input.
     """
-    desc = desc_override if desc_override is not None else settings.get("desc", "")
+    try:
+        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return False, "Playwright belum terinstall. Jalankan: pip install playwright && playwright install chromium"
 
-    # Tentukan line — biliup-cli 1.1.29 hanya support nilai tertentu
-    # default pakai "bda2" jika setting tidak valid
-    valid_lines = {
-        "bldsa", "cnbldsa", "andsa", "atdsa",
-        "bda2", "cnbd", "anbd", "atbd",
-        "tx", "cntx", "antx", "attx",
-        "bda", "txa", "alia",
-    }
-    line = settings.get("line", "bda2")
-    if line not in valid_lines:
-        line = "bda2"
+    cookie_path = account["path"]
+    try:
+        raw_cookies = json.loads(Path(cookie_path).read_text())
+    except Exception as e:
+        return False, f"Gagal baca cookies: {e}"
 
-    cmd = [
-        "biliup",
-        "-u", account["path"],      # --user-cookie HARUS sebelum subcommand
-        "upload",
-        video_path,
-        "--title", title or Path(video_path).stem,
-        "--desc", desc,
-        "--tid", str(settings.get("tid", 171)),
-        "--tag", tags,
-        "--copyright", str(settings.get("copyright", 1)),
-        "--line", line,
-        "--limit", str(settings.get("limit", 3)),
-    ]
+    # Konversi cookies ke format Playwright
+    # Support format dict (biliup) dan array (browser export)
+    pw_cookies = []
+    if isinstance(raw_cookies, dict):
+        for name, value in raw_cookies.items():
+            pw_cookies.append({
+                "name": name,
+                "value": str(value),
+                "domain": ".bilibili.tv",
+                "path": "/",
+            })
+    elif isinstance(raw_cookies, list):
+        for c in raw_cookies:
+            if "name" in c and "value" in c:
+                # Paksa domain ke .bilibili.tv
+                pw_cookies.append({
+                    "name": c["name"],
+                    "value": str(c["value"]),
+                    "domain": ".bilibili.tv",
+                    "path": c.get("path", "/"),
+                })
 
-    LOGGER.info(f"[biliup upload] cmd: {' '.join(cmd)}")
+    tags_list = [t.strip() for t in tags.split(",") if t.strip()]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        LOGGER.info(f"[biliup upload] stdout: {result.stdout[:200]}")
-        if result.returncode == 0:
-            return True, "Upload berhasil! ✅"
-        err = result.stderr[:300] or result.stdout[:300] or "Exit non-zero"
-        return False, err
-    except subprocess.TimeoutExpired:
-        return False, "Timeout (>1 jam)"
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+            )
+            await context.add_cookies(pw_cookies)
+            page = await context.new_page()
+
+            LOGGER.info("[bili.tv] Membuka studio.bilibili.tv...")
+            await page.goto("https://studio.bilibili.tv/upload", wait_until="networkidle", timeout=60000)
+
+            # Cek apakah sudah login
+            current_url = page.url
+            LOGGER.info(f"[bili.tv] URL setelah goto: {current_url}")
+            if "login" in current_url or "passport" in current_url:
+                await browser.close()
+                return False, "Cookies tidak valid / sudah expired. Login ulang dengan /bililogin"
+
+            # Tunggu file input muncul
+            LOGGER.info("[bili.tv] Menunggu tombol upload...")
+            try:
+                await page.wait_for_selector("input[type='file']", timeout=30000)
+            except PWTimeout:
+                # Coba screenshot untuk debug
+                await page.screenshot(path="/tmp/bili_debug.png")
+                await browser.close()
+                return False, "Timeout menunggu halaman upload. Cek /tmp/bili_debug.png"
+
+            # Upload file
+            LOGGER.info(f"[bili.tv] Upload file: {video_path}")
+            file_input = page.locator("input[type='file']").first
+            await file_input.set_input_files(video_path)
+
+            # Tunggu progress upload selesai — tunggu elemen judul muncul
+            LOGGER.info("[bili.tv] Menunggu file selesai diupload ke server...")
+            try:
+                # Tunggu max 2 jam untuk file besar
+                await page.wait_for_selector(
+                    "input[placeholder*='标题'], input[placeholder*='title'], input[placeholder*='Title']",
+                    timeout=7200000,
+                )
+            except PWTimeout:
+                await browser.close()
+                return False, "Timeout upload file (>2 jam)"
+
+            # Isi judul
+            LOGGER.info(f"[bili.tv] Mengisi judul: {title}")
+            title_input = page.locator(
+                "input[placeholder*='标题'], input[placeholder*='title'], input[placeholder*='Title']"
+            ).first
+            await title_input.click()
+            await title_input.fill("")
+            await title_input.type(title, delay=50)
+
+            # Isi deskripsi jika ada
+            if desc:
+                LOGGER.info(f"[bili.tv] Mengisi deskripsi...")
+                try:
+                    desc_input = page.locator(
+                        "textarea[placeholder*='简介'], textarea[placeholder*='desc'], textarea[placeholder*='Description']"
+                    ).first
+                    await desc_input.click()
+                    await desc_input.fill(desc)
+                except Exception:
+                    LOGGER.warning("[bili.tv] Gagal isi deskripsi, lanjut...")
+
+            # Isi tags satu per satu
+            if tags_list:
+                LOGGER.info(f"[bili.tv] Mengisi tags: {tags_list}")
+                try:
+                    tag_input = page.locator(
+                        "input[placeholder*='标签'], input[placeholder*='tag'], input[placeholder*='Tag']"
+                    ).first
+                    for tag in tags_list[:10]:  # max 10 tags
+                        await tag_input.click()
+                        await tag_input.type(tag, delay=50)
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(0.5)
+                except Exception:
+                    LOGGER.warning("[bili.tv] Gagal isi tags, lanjut...")
+
+            # Klik tombol Submit/Publish
+            LOGGER.info("[bili.tv] Klik tombol submit...")
+            submit_selectors = [
+                "button:has-text('发布')",
+                "button:has-text('提交')",
+                "button:has-text('Submit')",
+                "button:has-text('Publish')",
+                "button[type='submit']",
+                ".submit-btn",
+                ".publish-btn",
+            ]
+            submitted = False
+            for sel in submit_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible():
+                        await btn.click()
+                        submitted = True
+                        LOGGER.info(f"[bili.tv] Klik submit dengan selector: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if not submitted:
+                await page.screenshot(path="/tmp/bili_submit_debug.png")
+                await browser.close()
+                return False, "Tombol submit tidak ditemukan. Screenshot disimpan di /tmp/bili_submit_debug.png"
+
+            # Tunggu konfirmasi sukses
+            LOGGER.info("[bili.tv] Menunggu konfirmasi sukses...")
+            try:
+                await page.wait_for_selector(
+                    "text=成功, text=success, text=Success, text=审核, .success, .upload-success",
+                    timeout=30000,
+                )
+                await browser.close()
+                return True, "Upload berhasil! Video sedang dalam review ✅"
+            except PWTimeout:
+                # Cek URL berubah sebagai tanda sukses
+                await asyncio.sleep(3)
+                new_url = page.url
+                await browser.close()
+                if new_url != "https://studio.bilibili.tv/upload":
+                    return True, f"Upload kemungkinan berhasil (redirect ke {new_url}) ✅"
+                return False, "Tidak ada konfirmasi sukses dari halaman. Cek studio.bilibili.tv secara manual."
+
     except Exception as e:
-        return False, str(e)
+        LOGGER.error(f"[bili.tv] Error Playwright: {e}")
+        return False, f"Error: {str(e)[:300]}"
 
 
 # ─────────────────────────────────────────────
@@ -623,8 +758,16 @@ async def bili_upload_cmd(client, message: Message):
 
     results = []
     for acc in target_accounts:
-        ok, detail = await asyncio.to_thread(
-            _do_upload, video_path, acc, title, tags_str, settings, desc
+        await status_msg.edit(
+            f"🚀 <b>Mengupload ke bilibili.tv via browser...</b>\n\n"
+            f"📹 File: <code>{Path(video_path).name}</code> ({file_size_mb} MB)\n"
+            f"📝 Judul: {title}\n"
+            f"👥 Akun: <b>{acc['name']}</b>\n\n"
+            "⏳ Proses ini bisa memakan waktu sesuai ukuran file...\n"
+            "Jangan kirim perintah lain dulu."
+        )
+        ok, detail = await _do_upload_playwright(
+            video_path, acc, title, tags_str, desc
         )
         emoji = "✅" if ok else "❌"
         results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
