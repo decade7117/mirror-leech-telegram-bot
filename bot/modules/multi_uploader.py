@@ -662,7 +662,6 @@ async def _do_upload_playwright(
             }],
             "source":     "",
             "tid":        0,
-            "cover":      "",
             "title":      title,
             "tag":        ",".join(tags_list),
             "desc":       desc,
