@@ -664,43 +664,44 @@ async def bili_callback(client, query: CallbackQuery):
 
 
 # ─────────────────────────────────────────────
-#  REGISTRASI HANDLER
+#  REGISTRASI HANDLER — otomatis saat module di-import
 # ─────────────────────────────────────────────
 
-def add_handlers():
-    TgClient.bot.add_handler(
-        MessageHandler(
-            bili_login_cmd,
-            filters=filters.command("bililogin") & CustomFilters.authorized,
-        )
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_login_cmd,
+        filters=filters.command("bililogin") & CustomFilters.authorized,
     )
-    TgClient.bot.add_handler(
-        MessageHandler(
-            bili_accounts_cmd,
-            filters=filters.command("biliaccounts") & CustomFilters.authorized,
-        )
+)
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_accounts_cmd,
+        filters=filters.command("biliaccounts") & CustomFilters.authorized,
     )
-    TgClient.bot.add_handler(
-        MessageHandler(
-            bili_logout_cmd,
-            filters=filters.command("bililogout") & CustomFilters.authorized,
-        )
+)
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_logout_cmd,
+        filters=filters.command("bililogout") & CustomFilters.authorized,
     )
-    TgClient.bot.add_handler(
-        MessageHandler(
-            bili_set_cmd,
-            filters=filters.command("biliset") & CustomFilters.authorized,
-        )
+)
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_set_cmd,
+        filters=filters.command("biliset") & CustomFilters.authorized,
     )
-    TgClient.bot.add_handler(
-        MessageHandler(
-            bili_upload_cmd,
-            filters=filters.command("biliupload") & CustomFilters.authorized,
-        )
+)
+TgClient.bot.add_handler(
+    MessageHandler(
+        bili_upload_cmd,
+        filters=filters.command("biliupload") & CustomFilters.authorized,
     )
-    TgClient.bot.add_handler(
-        CallbackQueryHandler(
-            bili_callback,
-            filters=filters.regex(r"^bili_"),
-        )
+)
+TgClient.bot.add_handler(
+    CallbackQueryHandler(
+        bili_callback,
+        filters=filters.regex(r"^bili_"),
     )
+)
+
+LOGGER.info("bilibili_login: ✅ semua handler berhasil didaftarkan")
