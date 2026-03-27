@@ -57,7 +57,7 @@ DEFAULT_SETTINGS = {
     "tags": ["indonesia", "gaming", "anime"],
     "title_prefix": "",
     "desc": "",
-    "tid": 171,          # 171=游戏 160=生活 17=单机游戏 (Catatan: Bilibili TV mungkin beda ID)
+    "tid": 171,          # (Hanya berlaku untuk bilibili.com, untuk bilibili.tv akan diabaikan)
     "copyright": 1,      # 1=original 2=repost
     "line": "bda2",      # bda2=百度加速2 | tx=腾讯 | bldsa | alia=阿里
     "limit": 3,
@@ -452,7 +452,6 @@ async def _do_upload_playwright(
     title: str,
     tags: str,
     desc: str,
-    tid: int,  # Ditambahkan parameter tid
 ) -> tuple[bool, str]:
     """
     Upload video ke bilibili.tv via pure API (tanpa browser).
@@ -639,12 +638,14 @@ async def _do_upload_playwright(
             return False, f"Complete upload error: {complete_data}"
 
         # ── Step 6: Submit metadata ───────────────────────────
-        LOGGER.info(f"[bili.tv] Step 6: submit metadata — judul: {title} | tid: {tid}")
+        LOGGER.info(f"[bili.tv] Step 6: submit metadata — judul: {title}")
         tags_list = [t.strip() for t in tags.split(",") if t.strip()]
 
         # filename key dari complete response, fallback ke nama file
         video_key = complete_data.get("key", "").lstrip("/") or filename
 
+        # PAYLOAD KHUSUS BILIBILI TV (Internasional)
+        # Tidak menggunakan parameter tid (kategori) karena Bili TV tidak memiliki partisi
         submit_data = {
             "copyright": 1,
             "videos": [{
@@ -653,14 +654,13 @@ async def _do_upload_playwright(
                 "desc":     desc,
             }],
             "source":     "",
-            "tid":        tid,  # Menggunakan parameter dinamis dari setting
+            "tid":        0,  # <-- Kunci paksa ke 0, sangat krusial untuk Bilibili TV
             "cover":      "//p.bstarstatic.com/ugc/262ec39c213a1a6493b36826f2ff9a82.jpg",
             "title":      title,
             "tag":        ",".join(tags_list),
             "desc":       desc,
             "dynamic":    "",
             "no_reprint": 0,
-            "open_elec":  0,
         }
 
         try:
@@ -759,7 +759,6 @@ async def bili_upload_cmd(client, message: Message):
     desc      = custom_desc or settings.get("desc", "")
     tags_str  = ",".join(settings.get("tags", []))
     mode      = settings.get("account_mode", "round_robin")
-    tid_val   = settings.get("tid", 171)  # Ambil nilai tid dari settings
     valid_accs = [a for a in accounts if a["valid"]]
 
     if not valid_accs:
@@ -787,7 +786,7 @@ async def bili_upload_cmd(client, message: Message):
         f"📄 Deskripsi: {desc[:80] or '(default)'}\n"
         f"🏷 Tags: {tags_display}\n"
         f"👥 Akun: {', '.join(a['name'] for a in target_accounts)}\n"
-        f"📁 Kategori: tid={tid_val}"
+        f"📁 (Kategori diabaikan untuk Bilibili TV)"
     )
 
     # Download dulu ke /tmp
@@ -815,7 +814,7 @@ async def bili_upload_cmd(client, message: Message):
                 "Jangan kirim perintah lain dulu."
             )
             ok, detail = await _do_upload_playwright(
-                video_path, acc, title, tags_str, desc, tid_val
+                video_path, acc, title, tags_str, desc
             )
             emoji = "✅" if ok else "❌"
             results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
