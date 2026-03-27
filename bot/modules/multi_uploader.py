@@ -662,6 +662,7 @@ async def _do_upload_playwright(
             }],
             "source":     "",
             "tid":        0,
+            "cover":      "//p.bstarstatic.com/ugc/262ec39c213a1a6493b36826f2ff9a82.jpg",
             "title":      title,
             "tag":        ",".join(tags_list),
             "desc":       desc,
@@ -705,7 +706,7 @@ async def bili_upload_cmd(client, message: Message):
     Format perintah:
       /biliupload <url>
       /biliupload <url> | <judul>
-      /biliupload <url> | <judul> | <deskripsi>
+      /biliupload <url> | <deskripsi>
 
     Contoh:
       /biliupload https://example.com/video.mp4
