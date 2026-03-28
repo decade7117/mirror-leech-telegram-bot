@@ -94,9 +94,11 @@ def get_cookie_path(name: str) -> Path:
 @new_task
 async def bili_login_cmd(client, message: Message):
     user_id = message.from_user.id
-    args = message.text.split(maxsplit=1)
+    # FIX: Cegah AttributeError kalau teks kosong
+    text = message.text or message.caption or ""
+    args = text.split(maxsplit=1)
+    
     akun_name = args[1].strip() if len(args) > 1 else next_account_name()
-
     _login_sessions[user_id] = {"akun_name": akun_name, "waiting_file": True}
 
     await message.reply(
@@ -163,7 +165,8 @@ async def bili_accounts_cmd(client, message: Message):
 
 @new_task
 async def bili_logout_cmd(client, message: Message):
-    args = message.text.split(maxsplit=1)
+    text = message.text or message.caption or ""
+    args = text.split(maxsplit=1)
     if len(args) < 2: return await message.reply("Gunakan: <code>/bililogout [nama_akun]</code>")
     name = args[1].strip()
     cookie_path = get_cookie_path(name)
@@ -175,14 +178,14 @@ async def bili_logout_cmd(client, message: Message):
 
 @new_task
 async def bili_set_cmd(client, message: Message):
-    args = message.text.split(maxsplit=2)
+    text = message.text or message.caption or ""
+    args = text.split(maxsplit=2)
     settings = load_settings()
     if len(args) < 3: 
         return await message.reply("Cara pakai:\n/biliset tags anime,gaming\n/biliset mode all\n/biliset prefix Judul")
     
     key, val = args[1].lower(), args[2].strip()
     
-    # FIX MAPPING KEY AGAR SESUAI DENGAN PEMBACAAN DI UPLOAD
     if key == "tags":
         settings["tags"] = [t.strip().lstrip("#") for t in val.split(",") if t.strip()]
         await message.reply(f"✅ Tags diset: {' '.join(f'#{t}' for t in settings['tags'])}")
@@ -313,7 +316,13 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
 
         try:
             r = await client.post("https://api.bilibili.tv/intl/videoup/web2/add", params=submit_params, json=submit_data, headers={**base_headers, "Content-Type": "application/json"}, timeout=60)
-            res = r.json()
+            
+            # FIX: Deteksi error HTML vs JSON
+            try:
+                res = r.json()
+            except Exception:
+                return False, f"API Error (Kena limit Bilibili): {r.status_code}"
+                
             LOGGER.info(f"[bili.tv] final submit: {res}")
             if res.get("code") == 0: return True, "Upload & Submit Berhasil! ✅"
             return False, f"Submit gagal: {res}"
@@ -331,10 +340,10 @@ async def bili_upload_cmd(client, message: Message):
     if not accounts: return await message.reply("❌ Belum ada akun Bilibili valid!")
 
     settings = load_settings()
-    args = message.text.split(maxsplit=1)
+    text = message.text or message.caption or ""
+    args = text.split(maxsplit=1)
     if len(args) < 2: return await message.reply("❌ Format: <code>/biliupload &lt;url_video&gt; | &lt;judul&gt; | &lt;deskripsi&gt; | &lt;url_cover&gt;</code>")
 
-    # Parsing argumen dengan pemisah "|"
     parts = [p.strip() for p in args[1].strip().split("|")]
     
     url = parts[0]
@@ -360,7 +369,6 @@ async def bili_upload_cmd(client, message: Message):
         await message.reply("❌ Semua cookie tidak valid. Login ulang.")
         return
 
-    # PEMBACAAN MODE YANG BENAR
     if settings.get("account_mode", "round_robin") == "all":
         target_accounts = valid_accs
     else:
@@ -375,22 +383,22 @@ async def bili_upload_cmd(client, message: Message):
     video_path, err = await asyncio.to_thread(_download_from_url, url)
     if not video_path: return await status_msg.edit(f"❌ <b>Download gagal:</b> {err}")
 
-    # Agar bisa upload secara bersamaan (paralel) kalau mode all
+    # FIX: Upload secara sekuensial (satu per satu) untuk menghindari Rate Limit (-509)
     results = []
-    await status_msg.edit(f"🚀 <b>Mengupload ke {len(target_accounts)} akun BiliTV...</b>")
-    
-    upload_tasks = []
-    for acc in target_accounts:
-        upload_tasks.append(_do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover))
-    
-    upload_results = await asyncio.gather(*upload_tasks)
-    
-    for acc, (ok, detail) in zip(target_accounts, upload_results):
-        results.append(f"{'✅' if ok else '❌'} <b>{acc['name']}</b>: {detail}")
-
     try:
+        for i, acc in enumerate(target_accounts):
+            await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar, antrian sedang diproses...")
+            
+            ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover)
+            emoji = "✅" if ok else "❌"
+            results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
+            
+            # Jeda napas 3 detik antar akun biar nggak dicap spammer
+            if i < len(target_accounts) - 1:
+                await asyncio.sleep(3)
+                
+    finally:
         if video_path and os.path.exists(video_path): os.unlink(video_path)
-    except Exception: pass
 
     await status_msg.edit(f"📊 <b>Hasil Upload</b>\n📝 {title}\n\n" + "\n".join(results))
 
