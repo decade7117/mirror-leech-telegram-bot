@@ -35,7 +35,7 @@ from ..helper.telegram_helper.filters import CustomFilters
 from ..helper.ext_utils.bot_utils import new_task
 
 # ─────────────────────────────────────────────
-#  KONFIGURASI
+#  KONFIGURASI & GEMBOK ANTREAN
 # ─────────────────────────────────────────────
 BILI_DIR = Path("/app/bili_accounts")
 BILI_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,6 +51,9 @@ DEFAULT_SETTINGS = {
 }
 
 _login_sessions: dict = {}
+
+# GEMBOK ANTREAN GLOBAL UNTUK UPLOAD BILIBILI
+bili_upload_lock = asyncio.Lock()
 
 
 # ─────────────────────────────────────────────
@@ -94,7 +97,6 @@ def get_cookie_path(name: str) -> Path:
 @new_task
 async def bili_login_cmd(client, message: Message):
     user_id = message.from_user.id
-    # FIX: Cegah AttributeError kalau teks kosong
     text = message.text or message.caption or ""
     args = text.split(maxsplit=1)
     
@@ -317,7 +319,6 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
         try:
             r = await client.post("https://api.bilibili.tv/intl/videoup/web2/add", params=submit_params, json=submit_data, headers={**base_headers, "Content-Type": "application/json"}, timeout=60)
             
-            # FIX: Deteksi error HTML vs JSON
             try:
                 res = r.json()
             except Exception:
@@ -331,7 +332,7 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
 
 
 # ─────────────────────────────────────────────
-#  HANDLER UPLOAD VIDEO
+#  HANDLER UPLOAD VIDEO (DENGAN SISTEM ANTREAN)
 # ─────────────────────────────────────────────
 
 @new_task
@@ -374,33 +375,40 @@ async def bili_upload_cmd(client, message: Message):
     else:
         target_accounts = [valid_accs[int(time.time()) % len(valid_accs)]]
 
-    status_msg = await message.reply(
-        f"⬇️ <b>Mendownload video...</b>\n\n"
-        f"📝 Judul: {title}\n"
-        f"🖼 Cover: {'Custom URL' if custom_cover else 'Default'}"
-    )
-    
-    video_path, err = await asyncio.to_thread(_download_from_url, url)
-    if not video_path: return await status_msg.edit(f"❌ <b>Download gagal:</b> {err}")
+    # Cek apakah sedang ada antrean berjalan
+    if bili_upload_lock.locked():
+        status_msg = await message.reply(f"⏳ <b>Menunggu antrean upload...</b>\n📝 {title}")
+    else:
+        status_msg = await message.reply(f"🔄 Memulai proses...\n📝 {title}")
 
-    # FIX: Upload secara sekuensial (satu per satu) untuk menghindari Rate Limit (-509)
-    results = []
-    try:
-        for i, acc in enumerate(target_accounts):
-            await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar, antrian sedang diproses...")
-            
-            ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover)
-            emoji = "✅" if ok else "❌"
-            results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
-            
-            # Jeda napas 3 detik antar akun biar nggak dicap spammer
-            if i < len(target_accounts) - 1:
-                await asyncio.sleep(3)
+    # ===== GEMBOK ANTREAN DIBUKA DI SINI =====
+    async with bili_upload_lock:
+        await status_msg.edit(
+            f"⬇️ <b>Mendownload video...</b>\n\n"
+            f"📝 Judul: {title}\n"
+            f"🖼 Cover: {'Custom URL' if custom_cover else 'Default'}"
+        )
+        
+        video_path, err = await asyncio.to_thread(_download_from_url, url)
+        if not video_path: return await status_msg.edit(f"❌ <b>Download gagal:</b> {err}")
+
+        results = []
+        try:
+            for i, acc in enumerate(target_accounts):
+                await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar, antrian sedang diproses...")
                 
-    finally:
-        if video_path and os.path.exists(video_path): os.unlink(video_path)
+                ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover)
+                emoji = "✅" if ok else "❌"
+                results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
+                
+                if i < len(target_accounts) - 1:
+                    await asyncio.sleep(3)
+                    
+        finally:
+            if video_path and os.path.exists(video_path): os.unlink(video_path)
 
-    await status_msg.edit(f"📊 <b>Hasil Upload</b>\n📝 {title}\n\n" + "\n".join(results))
+        await status_msg.edit(f"📊 <b>Hasil Upload</b>\n📝 {title}\n\n" + "\n".join(results))
+    # ===== GEMBOK ANTREAN DITUTUP, VIDEO SELANJUTNYA JALAN =====
 
 
 @new_task
