@@ -134,6 +134,7 @@ def _upload_gofile(path: str, key: str) -> str:
     except Exception as e:
         return f"❌ Gofile exception: {e}"
 
+
 # ── Upload: Pixeldrain ────────────────────────────────────────────────────────
 def _upload_pixeldrain(path: str, key: str) -> str:
     import requests
@@ -146,6 +147,7 @@ def _upload_pixeldrain(path: str, key: str) -> str:
         return f"❌ Pixeldrain error: {r.text[:200]}"
     except Exception as e:
         return f"❌ Pixeldrain exception: {e}"
+
 
 # ── Upload: Buzzheavier ───────────────────────────────────────────────────────
 def _upload_buzzheavier(path: str, key: str) -> str:
@@ -164,6 +166,7 @@ def _upload_buzzheavier(path: str, key: str) -> str:
         return f"❌ Buzzheavier HTTP {r.status_code}: {r.text[:300]}"
     except Exception as e:
         return f"❌ Buzzheavier exception: {e}"
+
 
 # ── Upload: Filemirage ────────────────────────────────────────────────────────
 def _upload_filemirage(path: str, key: str) -> str:
@@ -198,6 +201,53 @@ def _upload_filemirage(path: str, key: str) -> str:
         return f"❌ Filemirage: selesai tapi tidak ada URL — {last_rj}"
     except Exception as e:
         return f"❌ Filemirage exception: {e}"
+
+
+# ── Upload: Transfer.it (Menggunakan Playwright) ──────────────────────────────
+def _upload_transferit(path: str, key: str) -> str:
+    """
+    Fungsi ini berjalan sinkron untuk membungkus kode asinkron dari Playwright
+    agar kompatibel dengan arsitektur to_thread di multi_mirror_cmd
+    """
+    import asyncio
+    from playwright.async_api import async_playwright
+    from .. import LOGGER
+
+    async def _run_playwright():
+        LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+            page = await context.new_page()
+            try:
+                await page.goto("https://transfer.it/")
+                
+                # FIX: Menggunakan .first agar Playwright tidak bingung memilih elemen
+                LOGGER.info("[Transfer.it] Memasukkan file...")
+                await page.locator("input[type='file']").first.set_input_files(path)
+                
+                LOGGER.info("[Transfer.it] Menekan tombol Transfer...")
+                transfer_btn = page.locator("button:has-text('Transfer')").first
+                await transfer_btn.wait_for(state="visible", timeout=15000)
+                await transfer_btn.click()
+                
+                LOGGER.info("[Transfer.it] Menunggu proses upload selesai...")
+                await page.locator("text='Completed!'").first.wait_for(state="visible", timeout=3600000)
+
+                LOGGER.info("[Transfer.it] Mengambil link...")
+                link_element = page.locator("input[readonly]").first
+                if await link_element.count() > 0:
+                    return await link_element.input_value()
+                return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
+            except Exception as e:
+                err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
+                LOGGER.error(err_msg)
+                return err_msg
+            finally:
+                await browser.close()
+
+    return asyncio.run(_run_playwright())
+
 
 # ── Upload: Player4me ─────────────────────────────────────────────────────────
 def _p4m_headers(key: str) -> dict:
@@ -276,6 +326,7 @@ def _upload_player4me(path: str, key: str) -> str:
     if not key: return "❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN"
     return _p4m_tus_upload(path, key)
 
+
 # ── Upload: Akirabox ──────────────────────────────────────────────────────────
 def _upload_akirabox(path: str, key: str) -> str:
     import requests
@@ -288,46 +339,6 @@ def _upload_akirabox(path: str, key: str) -> str:
     except Exception as e:
         return f"❌ Akirabox exception: {e}"
 
-# ── Upload: Transfer.it (Menggunakan Playwright) ──────────────────────────────
-def _upload_transferit(path: str, key: str) -> str:
-    """
-    Fungsi ini berjalan sinkron untuk membungkus kode asinkron dari Playwright
-    agar kompatibel dengan arsitektur to_thread di multi_mirror_cmd
-    """
-    import asyncio
-    from playwright.async_api import async_playwright
-    from .. import LOGGER
-
-    async def _run_playwright():
-        LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-            page = await context.new_page()
-            try:
-                await page.goto("https://transfer.it/")
-                await page.locator("input[type='file']").set_input_files(path)
-                transfer_btn = page.locator("button:has-text('Transfer')")
-                await transfer_btn.wait_for(state="visible", timeout=15000)
-                await transfer_btn.click()
-                
-                # Tunggu proses selesai
-                await page.locator("text='Completed!'").wait_for(state="visible", timeout=3600000)
-
-                # Ekstrak Link
-                link_element = page.locator("input[readonly]")
-                if await link_element.count() > 0:
-                    return await link_element.input_value()
-                return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
-            except Exception as e:
-                err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
-                LOGGER.error(err_msg)
-                return err_msg
-            finally:
-                await browser.close()
-
-    return asyncio.run(_run_playwright())
-
 
 # ── Routing ───────────────────────────────────────────────────────────────────
 _UPLOAD_FUNCS = {
@@ -339,6 +350,7 @@ _UPLOAD_FUNCS = {
     "player4me":   _upload_player4me,
     "akirabox":    _upload_akirabox,
 }
+
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 @new_task
