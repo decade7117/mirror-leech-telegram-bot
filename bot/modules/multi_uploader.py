@@ -215,7 +215,7 @@ def _upload_filemirage(path: str, key: str, user_id: int) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (Playwright dengan Live Progress, Tanpa Screenshot) ──
+# ── Upload: Transfer.it (Playwright dengan Live Progress, Fix JS Checkbox) ───
 async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
     from playwright.async_api import async_playwright
     from .. import LOGGER
@@ -231,11 +231,15 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
             await page.locator("input[type='file']").first.set_input_files(path)
             await page.wait_for_timeout(2000)
             
-            # Memastikan kotak TOS dicentang (kalau ada dan belum tercentang)
-            tos_checkbox = page.locator("input[type='checkbox']").first
-            if await tos_checkbox.count() > 0 and not await tos_checkbox.is_checked():
-                await tos_checkbox.check(force=True)
-                await page.wait_for_timeout(500)
+            # FIX: Bypass error "hidden checkbox" menggunakan eksekusi JavaScript murni
+            try:
+                tos_checkbox = page.locator("input[type='checkbox']").first
+                if await tos_checkbox.count() > 0:
+                    await tos_checkbox.evaluate("node => node.checked = true")
+                    await tos_checkbox.evaluate("node => node.dispatchEvent(new Event('change'))")
+                    await page.wait_for_timeout(500)
+            except Exception as e:
+                LOGGER.info(f"[Transfer.it] Mengabaikan TOS checkbox: {e}")
             
             transfer_btn = page.locator("button:has-text('Transfer'):visible").first
             await transfer_btn.wait_for(state="visible", timeout=15000)
