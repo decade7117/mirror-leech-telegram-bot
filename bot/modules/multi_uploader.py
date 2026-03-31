@@ -1,444 +1,479 @@
 """
 ============================================================
- bot/modules/bilibili_login.py
- Tambahkan ke folder: bot/modules/
-
+ bot/modules/multi_uploader.py
  FITUR:
- - /bililogin      → simpan cookies bilibili.tv (upload file JSON)
- - /biliaccounts   → lihat semua akun yang sudah login
- - /bililogout     → logout / hapus akun
- - /biliupload     → upload video via direct URL ke bilibili.tv
- - /biliset        → atur default tags, judul, deskripsi
- - /bilicancel     → batalkan sesi login yang aktif
+ - /gofile, /pixeldrain, /buzzheavier, /filemirage, /player4me, /akirabox
+ - /transferit     → download video dari URL dan upload ke transfer.it (via Playwright)
 ============================================================
 """
 
-import asyncio
-import json
+import math
 import os
-import time
-import urllib.request
-from pathlib import Path
+import urllib.parse
+from asyncio import to_thread
 
-from pyrogram import filters
-from pyrogram.handlers import MessageHandler, CallbackQueryHandler
-from pyrogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    CallbackQuery,
-)
+from pyrogram.filters import command
+from pyrogram.handlers import MessageHandler
 
-from .. import LOGGER
 from ..core.telegram_manager import TgClient
-from ..helper.telegram_helper.filters import CustomFilters
 from ..helper.ext_utils.bot_utils import new_task
+from ..helper.telegram_helper.filters import CustomFilters
 
-# ─────────────────────────────────────────────
-#  KONFIGURASI & GEMBOK ANTREAN
-# ─────────────────────────────────────────────
-BILI_DIR = Path("/app/bili_accounts")
-BILI_DIR.mkdir(parents=True, exist_ok=True)
-
-BILI_SETTINGS_FILE = BILI_DIR / "settings.json"
-
-DEFAULT_SETTINGS = {
-    "tags": ["anime", "indonesia"],
-    "title_prefix": "",
-    "desc": "",
-    "copyright": 1,
-    "account_mode": "round_robin", 
+# ── In-memory API key store ───────────────────────────────────────────────────
+_API_KEYS: dict = {
+    "gofile":      "",
+    "pixeldrain":  "",
+    "transferit":  "",
+    "filemirage":  "",
+    "buzzheavier": "",
+    "player4me":   "",
+    "akirabox":    "",
 }
 
-_login_sessions: dict = {}
+HOST_LIST     = list(_API_KEYS.keys())
+SET_HOST_LIST = [f"set{h}" for h in HOST_LIST]
+TEMP_DIR      = "/tmp/multi_uploader_dl"
+DOWNLOAD_DIR  = "/app/downloads"
+P4M_BASE      = "https://player4me.com"
 
-# GEMBOK ANTREAN GLOBAL UNTUK UPLOAD BILIBILI
-bili_upload_lock = asyncio.Lock()
+
+# ── MongoDB persistence ───────────────────────────────────────────────────────
+async def _db_load_keys():
+    try:
+        from ..core.config_manager import Config
+        import motor.motor_asyncio
+        client = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
+        db     = client.mltb
+        doc    = await db.multi_uploader_keys.find_one({"_id": "api_keys"})
+        if doc:
+            for host in HOST_LIST:
+                if doc.get(host):
+                    _API_KEYS[host] = doc[host]
+        client.close()
+    except Exception as e:
+        from .. import LOGGER
+        LOGGER.warning(f"multi_uploader: gagal load keys dari DB — {e}")
+
+async def _db_save_keys():
+    try:
+        from ..core.config_manager import Config
+        import motor.motor_asyncio
+        client = motor.motor_asyncio.AsyncIOMotorClient(Config.DATABASE_URL)
+        db     = client.mltb
+        await db.multi_uploader_keys.update_one(
+            {"_id": "api_keys"},
+            {"$set": {k: v for k, v in _API_KEYS.items()}},
+            upsert=True,
+        )
+        client.close()
+    except Exception as e:
+        from .. import LOGGER
+        LOGGER.warning(f"multi_uploader: gagal simpan keys ke DB — {e}")
+
+from .. import LOGGER as _LOGGER
+try:
+    import asyncio as _asyncio
+    _loop = _asyncio.get_event_loop()
+    if _loop.is_running():
+        _loop.create_task(_db_load_keys())
+    else:
+        _loop.run_until_complete(_db_load_keys())
+except Exception as _e:
+    _LOGGER.warning(f"multi_uploader: skip DB load — {_e}")
 
 
-# ─────────────────────────────────────────────
-#  HELPER
-# ─────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _safe_json(r):
+    try:
+        text = r.text.strip()
+        if not text:
+            return None
+        import json
+        return json.loads(text)
+    except Exception:
+        return None
 
-def load_settings() -> dict:
-    if BILI_SETTINGS_FILE.exists():
+def _sizeof_fmt(num_bytes: int) -> str:
+    if num_bytes >= 1024 ** 3: return f"{num_bytes / 1024 ** 3:.1f} GB"
+    if num_bytes >= 1024 ** 2: return f"{num_bytes / 1024 ** 2:.1f} MB"
+    return f"{num_bytes / 1024:.1f} KB"
+
+def _download_url(url: str, dest: str):
+    import requests
+    try:
+        with requests.get(url, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def _find_file_in_downloads(name: str):
+    if os.path.isabs(name) and os.path.exists(name): return name
+    if not os.path.isdir(DOWNLOAD_DIR): return None
+    name_lower = name.lower()
+    for root, dirs, files in os.walk(DOWNLOAD_DIR):
+        for f in files:
+            if f.lower() == name_lower: return os.path.join(root, f)
+    return None
+
+
+# ── Upload: Gofile ────────────────────────────────────────────────────────────
+def _upload_gofile(path: str, key: str) -> str:
+    import requests
+    try:
+        server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
+        with open(path, "rb") as f:
+            data = {"token": key} if key else {}
+            r = requests.post(f"https://{server}.gofile.io/contents/uploadfile", files={"file": (os.path.basename(path), f)}, data=data, timeout=600)
+        rj = _safe_json(r)
+        if rj and rj.get("status") == "ok": return rj["data"]["downloadPage"]
+        return f"❌ Gofile error: {r.text[:200]}"
+    except Exception as e:
+        return f"❌ Gofile exception: {e}"
+
+# ── Upload: Pixeldrain ────────────────────────────────────────────────────────
+def _upload_pixeldrain(path: str, key: str) -> str:
+    import requests
+    try:
+        auth = ("", key) if key else None
+        with open(path, "rb") as f:
+            r = requests.post("https://pixeldrain.com/api/file", files={"file": (os.path.basename(path), f)}, auth=auth, timeout=600)
+        rj = _safe_json(r)
+        if rj and rj.get("id"): return f"https://pixeldrain.com/u/{rj['id']}"
+        return f"❌ Pixeldrain error: {r.text[:200]}"
+    except Exception as e:
+        return f"❌ Pixeldrain exception: {e}"
+
+# ── Upload: Buzzheavier ───────────────────────────────────────────────────────
+def _upload_buzzheavier(path: str, key: str) -> str:
+    import requests
+    try:
+        fname   = urllib.parse.quote(os.path.basename(path), safe="")
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        with open(path, "rb") as f:
+            r = requests.put(f"https://w.buzzheavier.com/{fname}", data=f, headers=headers, timeout=600)
+        rj = _safe_json(r)
+        if rj:
+            data = rj.get("data", {})
+            url  = data.get("url")
+            if not url and data.get("id"): url = f"https://buzzheavier.com/{data['id']}"
+            if url: return url
+        return f"❌ Buzzheavier HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return f"❌ Buzzheavier exception: {e}"
+
+# ── Upload: Filemirage ────────────────────────────────────────────────────────
+def _upload_filemirage(path: str, key: str) -> str:
+    import requests
+    CHUNK_SIZE = 100 * 1024 * 1024
+    headers    = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        srv_r = requests.get("https://filemirage.com/api/servers", headers=headers, timeout=30)
+        srv_j = _safe_json(srv_r)
+        if not srv_j or not srv_j.get("success"): return f"❌ Filemirage get server gagal: {srv_r.text[:300]}"
+
+        server       = srv_j["data"]["server"].rstrip("/")
+        upload_id    = srv_j["data"]["upload_id"]
+        filename     = os.path.basename(path)
+        file_size    = os.path.getsize(path)
+        total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
+        upload_url   = f"{server}/upload.php"
+        last_rj      = {}
+
+        with open(path, "rb") as fh:
+            for i in range(total_chunks):
+                chunk_data = fh.read(CHUNK_SIZE)
+                is_last    = (i == total_chunks - 1)
+                up_r = requests.post(upload_url, headers=headers, files={"file": (filename, chunk_data, "application/octet-stream")}, data={"filename": filename, "upload_id": upload_id, "chunk_number": str(i), "total_chunks": str(total_chunks)}, timeout=600)
+                if up_r.status_code not in (200, 201): return f"❌ Filemirage chunk {i}: HTTP {up_r.status_code}\n{up_r.text[:300]}"
+                if not is_last: continue
+                up_j = _safe_json(up_r)
+                if up_j: last_rj = up_j
+
+        url = last_rj.get("data", {}).get("url") if isinstance(last_rj.get("data"), dict) else None
+        if url: return url
+        return f"❌ Filemirage: selesai tapi tidak ada URL — {last_rj}"
+    except Exception as e:
+        return f"❌ Filemirage exception: {e}"
+
+# ── Upload: Player4me ─────────────────────────────────────────────────────────
+def _p4m_headers(key: str) -> dict:
+    return {"api-token": key, "Accept": "application/json"}
+
+def _p4m_advance_upload_url(url: str, key: str, name: str = None) -> str:
+    import requests
+    import time
+    headers = _p4m_headers(key)
+    payload = {"url": url}
+    if name: payload["name"] = name
+    try:
+        r = requests.post(f"{P4M_BASE}/api/v1/video/advance-upload", json=payload, headers=headers, timeout=30)
+        rj = _safe_json(r)
+        if r.status_code not in (200, 201) or not rj: return f"❌ Player4me advance-upload gagal: HTTP {r.status_code} — {r.text[:300]}"
+
+        task_id = rj.get("id")
+        if not task_id: return f"❌ Player4me: tidak dapat task ID — {rj}"
+
+        max_wait, interval, waited = 1800, 15, 0
+        while waited < max_wait:
+            time.sleep(interval)
+            waited += interval
+            st_r = requests.get(f"{P4M_BASE}/api/v1/video/advance-upload/{task_id}", headers=headers, timeout=30)
+            sj = _safe_json(st_r)
+            if not sj: continue
+            status = sj.get("status", "")
+            if status == "Completed":
+                videos = sj.get("videos", [])
+                if videos:
+                    vid_id = videos[0] if isinstance(videos[0], str) else videos[0].get("id", "")
+                    if vid_id: return f"https://player4me.com/video/{vid_id}"
+                return f"✅ Player4me selesai (task {task_id}) tapi video ID tidak tersedia"
+            elif status in ("Failed", "Error"): return f"❌ Player4me task gagal: {sj.get('error', 'unknown')}"
+
+        return f"❌ Player4me timeout 30 menit. Task ID: {task_id} — cek manual di dashboard"
+    except Exception as e:
+        return f"❌ Player4me exception: {e}"
+
+def _p4m_tus_upload(path: str, key: str) -> str:
+    import base64
+    import requests
+    headers, CHUNK = _p4m_headers(key), 52_428_800
+    try:
+        ep_r = requests.get(f"{P4M_BASE}/api/v1/video/upload", headers=headers, timeout=30)
+        ep_j = _safe_json(ep_r)
+        if not ep_j or ep_r.status_code != 200: return f"❌ Player4me TUS endpoint gagal: {ep_r.text[:200]}"
+
+        tus_url, access_token = ep_j.get("tusUrl", "").rstrip("/") + "/", ep_j.get("accessToken", "")
+        if not tus_url or not access_token: return f"❌ Player4me: tidak dapat tusUrl/accessToken — {ep_j}"
+
+        filename, file_size = os.path.basename(path), os.path.getsize(path)
+        metadata = f"accessToken {base64.b64encode(access_token.encode()).decode()},filename {base64.b64encode(filename.encode()).decode()},filetype {base64.b64encode('video/mp4'.encode()).decode()}"
+
+        create_r = requests.post(tus_url, headers={"Tus-Resumable": "1.0.0", "Upload-Length": str(file_size), "Upload-Metadata": metadata, "Content-Length": "0", "api-token": key}, timeout=30)
+        if create_r.status_code != 201: return f"❌ Player4me TUS create gagal: HTTP {create_r.status_code} — {create_r.text[:200]}"
+
+        upload_url = create_r.headers.get("Location", "")
+        if not upload_url: return "❌ Player4me TUS: tidak dapat upload location"
+
+        offset = 0
+        with open(path, "rb") as fh:
+            while offset < file_size:
+                chunk = fh.read(CHUNK)
+                patch_r = requests.patch(upload_url, data=chunk, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": str(offset), "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(chunk)), "api-token": key}, timeout=600)
+                if patch_r.status_code not in (200, 204): return f"❌ Player4me TUS chunk gagal offset {offset}: HTTP {patch_r.status_code}"
+                offset += len(chunk)
+
+        vid_id = upload_url.rstrip("/").split("/")[-1]
+        if vid_id: return f"https://player4me.com/video/{vid_id}"
+        return "✅ Player4me upload selesai! Cek dashboard untuk link video."
+    except Exception as e:
+        return f"❌ Player4me TUS exception: {e}"
+
+def _upload_player4me(path: str, key: str) -> str:
+    if not key: return "❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN"
+    return _p4m_tus_upload(path, key)
+
+# ── Upload: Akirabox ──────────────────────────────────────────────────────────
+def _upload_akirabox(path: str, key: str) -> str:
+    import requests
+    try:
+        with open(path, "rb") as f:
+            r = requests.post("https://akirabox.com/api/upload", files={"file": (os.path.basename(path), f)}, data={"api_key": key}, timeout=600)
+        rj = _safe_json(r)
+        if rj and r.status_code == 200: return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
+        return f"❌ Akirabox HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return f"❌ Akirabox exception: {e}"
+
+# ── Upload: Transfer.it (Menggunakan Playwright) ──────────────────────────────
+def _upload_transferit(path: str, key: str) -> str:
+    """
+    Fungsi ini berjalan sinkron untuk membungkus kode asinkron dari Playwright
+    agar kompatibel dengan arsitektur to_thread di multi_mirror_cmd
+    """
+    import asyncio
+    from playwright.async_api import async_playwright
+    from .. import LOGGER
+
+    async def _run_playwright():
+        LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+            page = await context.new_page()
+            try:
+                await page.goto("https://transfer.it/")
+                await page.locator("input[type='file']").set_input_files(path)
+                transfer_btn = page.locator("button:has-text('Transfer')")
+                await transfer_btn.wait_for(state="visible", timeout=15000)
+                await transfer_btn.click()
+                
+                # Tunggu proses selesai
+                await page.locator("text='Completed!'").wait_for(state="visible", timeout=3600000)
+
+                # Ekstrak Link
+                link_element = page.locator("input[readonly]")
+                if await link_element.count() > 0:
+                    return await link_element.input_value()
+                return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
+            except Exception as e:
+                err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
+                LOGGER.error(err_msg)
+                return err_msg
+            finally:
+                await browser.close()
+
+    return asyncio.run(_run_playwright())
+
+
+# ── Routing ───────────────────────────────────────────────────────────────────
+_UPLOAD_FUNCS = {
+    "gofile":      _upload_gofile,
+    "pixeldrain":  _upload_pixeldrain,
+    "buzzheavier": _upload_buzzheavier,
+    "filemirage":  _upload_filemirage,
+    "transferit":  _upload_transferit,
+    "player4me":   _upload_player4me,
+    "akirabox":    _upload_akirabox,
+}
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
+@new_task
+async def set_api_key_cmd(_, message):
+    parts = message.text.strip().split(maxsplit=1)
+    host  = parts[0].lstrip("/").lower().replace("set", "", 1)
+    if len(parts) < 2:
+        hints = {
+            "gofile":     "API_TOKEN (opsional)",
+            "pixeldrain": "API_KEY",
+            "filemirage": "API_TOKEN",
+            "player4me":  "API_TOKEN (dari player4me.com/account/api)",
+            "akirabox":   "API_KEY",
+            "buzzheavier":"API_KEY (opsional)",
+            "transferit": "tidak butuh API_KEY",
+        }
+        await message.reply(f"Gunakan: <code>/set{host} {hints.get(host, 'API_KEY')}</code>")
+        return
+    _API_KEYS[host] = parts[1].strip()
+    await _db_save_keys()
+    await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan ke database!")
+
+
+@new_task
+async def multi_mirror_cmd(_, message):
+    parts = message.text.strip().split(maxsplit=1)
+    host  = parts[0].lstrip("/").lower()
+
+    func = _UPLOAD_FUNCS.get(host)
+    if not func:
+        await message.reply(f"❌ Host tidak dikenal: <code>{host}</code>")
+        return
+
+    if len(parts) < 2:
+        await message.reply(
+            f"🔗 <b>Upload ke {host.capitalize()}</b>\n\n"
+            f"<b>Cara 1</b> — Link langsung:\n"
+            f"<code>/{host} https://example.com/file.mkv</code>\n\n"
+            f"<b>Cara 2</b> — Path lokal:\n"
+            f"<code>/{host} /app/downloads/namafile.mkv</code>\n\n"
+            f"<b>Cara 3</b> — Nama file saja:\n"
+            f"<code>/{host} namafile.mkv</code>"
+        )
+        return
+
+    arg    = parts[1].strip()
+    is_url = arg.startswith(("http://", "https://"))
+    is_abs = arg.startswith("/")
+
+    status_msg = await message.reply("🔍 Memproses…")
+
+    if host == "player4me" and is_url:
+        key = _API_KEYS.get("player4me", "")
+        if not key:
+            await status_msg.edit("❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN")
+            return
+        await status_msg.edit(
+            f"📤 Mengirim URL ke server Player4me…\n"
+            f"(Server Player4me yang download filenya)\n"
+            f"<code>{arg}</code>\n\n"
+            f"<i>Bot akan poll status setiap 15 detik…</i>"
+        )
+        fname = arg.split("/")[-1].split("?")[0].strip() or None
+        link  = await to_thread(_p4m_advance_upload_url, arg, key, fname)
+        await status_msg.edit(f"✅ <b>Upload ke Player4me selesai!</b>\n\n🔗 {link}")
+        return
+
+    need_del = False
+    dest     = None
+
+    if is_url:
+        fname = arg.split("/")[-1].split("?")[0].strip()
+        if not fname or len(fname) < 3:
+            fname = "file_download"
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        dest = os.path.join(TEMP_DIR, fname)
+        await status_msg.edit(f"⬇️ Mengunduh file dari URL…\n<code>{arg}</code>")
+        ok, err = await to_thread(_download_url, arg, dest)
+        if not ok:
+            await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
+            return
+        need_del = True
+
+    elif is_abs:
+        dest = arg
+        if not os.path.exists(dest):
+            await status_msg.edit(f"❌ File tidak ditemukan: <code>{dest}</code>")
+            return
+
+    else:
+        await status_msg.edit(f"🔍 Mencari <code>{arg}</code> di folder downloads…")
+        found = await to_thread(_find_file_in_downloads, arg)
+        if not found:
+            files_list = []
+            if os.path.isdir(DOWNLOAD_DIR):
+                for root, dirs, files in os.walk(DOWNLOAD_DIR):
+                    for f in files[:10]:
+                        files_list.append(f"• <code>{f}</code>")
+            hint = "\n".join(files_list) if files_list else "<i>Folder downloads kosong</i>"
+            await status_msg.edit(
+                f"❌ File <code>{arg}</code> tidak ditemukan.\n\nFile tersedia:\n{hint}"
+            )
+            return
+        dest = found
+
+    size_str = _sizeof_fmt(os.path.getsize(dest))
+    
+    if host == "transferit":
+        await status_msg.edit(f"⬆️ Mengupload ke <b>Transfer.it</b> (Via Playwright)…\n⏳ Harap bersabar, proses ini memakan waktu\n📁 <code>{os.path.basename(dest)}</code> ({size_str})")
+    else:
+        await status_msg.edit(f"⬆️ Mengupload ke <b>{host.capitalize()}</b>…\n📁 <code>{os.path.basename(dest)}</code> ({size_str})")
+
+    key  = _API_KEYS.get(host, "")
+    link = await to_thread(func, dest, key)
+
+    if need_del:
         try:
-            return json.loads(BILI_SETTINGS_FILE.read_text())
+            os.remove(dest)
         except Exception:
             pass
-    return DEFAULT_SETTINGS.copy()
 
-def save_settings(s: dict):
-    BILI_SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False))
-
-def list_accounts() -> list[dict]:
-    accounts = []
-    for f in sorted(BILI_DIR.glob("cookies_*.json")):
-        name = f.stem.replace("cookies_", "")
-        try:
-            data = json.loads(f.read_text())
-            valid = bool(data)
-        except Exception:
-            valid = False
-        accounts.append({"name": name, "path": str(f), "valid": valid})
-    return accounts
-
-def next_account_name() -> str:
-    return f"akun{len(list_accounts()) + 1}"
-
-def get_cookie_path(name: str) -> Path:
-    return BILI_DIR / f"cookies_{name}.json"
-
-
-# ─────────────────────────────────────────────
-#  HANDLER LOGIN & ACCOUNTS
-# ─────────────────────────────────────────────
-
-@new_task
-async def bili_login_cmd(client, message: Message):
-    user_id = message.from_user.id
-    text = message.text or message.caption or ""
-    args = text.split(maxsplit=1)
-    
-    akun_name = args[1].strip() if len(args) > 1 else next_account_name()
-    _login_sessions[user_id] = {"akun_name": akun_name, "waiting_file": True}
-
-    await message.reply(
-        f"📂 <b>Upload Cookies Bilibili</b>\n\n"
-        f"👤 Akun: <b>{akun_name}</b>\n\n"
-        "Kirim file <code>cookies.json</code> kamu sekarang.\n"
-        "⏱ Menunggu file selama 5 menit... (/bilicancel untuk batal)"
-    )
-    asyncio.get_event_loop().create_task(_expire_login_session(user_id, client, message.chat.id))
-
-async def _expire_login_session(user_id: int, client, chat_id: int):
-    await asyncio.sleep(300)
-    session = _login_sessions.get(user_id)
-    if session and session.get("waiting_file"):
-        _login_sessions.pop(user_id, None)
-        await client.send_message(chat_id, "⏱ Sesi login timeout. Ketik /bililogin untuk coba lagi.")
-
-@new_task
-async def bili_receive_cookie_file(client, message: Message):
-    user_id = message.from_user.id
-    session = _login_sessions.get(user_id)
-    if not session or not session.get("waiting_file"): return
-
-    if not message.document or not (message.document.file_name or "").endswith(".json"):
-        await message.reply("❌ Kirim sebagai file <code>.json</code>.")
-        return
-
-    akun_name = session["akun_name"]
-    cookie_path = get_cookie_path(akun_name)
-    status_msg = await message.reply(f"⏳ Memproses cookies <b>{akun_name}</b>...")
-    tmp_path = f"/tmp/cookies_{user_id}.json"
-    await client.download_media(message, file_name=tmp_path)
-
-    try:
-        data = json.loads(Path(tmp_path).read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            data = {item["name"]: item["value"] for item in data if isinstance(item, dict) and "name" in item and "value" in item}
-        cookie_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-        await status_msg.edit(f"✅ <b>Cookies {akun_name} disimpan!</b>\nTotal akun: {len(list_accounts())}")
-    except Exception as e:
-        await status_msg.edit(f"❌ JSON tidak valid:\n<code>{e}</code>")
-    finally:
-        _login_sessions.pop(user_id, None)
-        if os.path.exists(tmp_path): os.unlink(tmp_path)
-
-@new_task
-async def bili_accounts_cmd(client, message: Message):
-    accounts = list_accounts()
-    settings = load_settings()
-    if not accounts:
-        return await message.reply("📭 Belum ada akun. Gunakan /bililogin")
-
-    lines = ["<b>📋 Daftar Akun Bilibili</b>\n"]
-    for i, acc in enumerate(accounts, 1):
-        lines.append(f"{i}. {'✅' if acc['valid'] else '⚠️'} <b>{acc['name']}</b>")
-    
-    tags_str = ", ".join(f"#{t}" for t in settings.get("tags", []))
-    lines.append(f"\n🏷 Tags: {tags_str or '-'}")
-    lines.append(f"🔄 Mode: <b>{settings.get('account_mode', 'round_robin')}</b>")
-    
-    await message.reply("\n".join(lines), reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Login Baru", callback_data="bili_new_login"), InlineKeyboardButton("⚙️ Set", callback_data="bili_settings")]
-    ]))
-
-@new_task
-async def bili_logout_cmd(client, message: Message):
-    text = message.text or message.caption or ""
-    args = text.split(maxsplit=1)
-    if len(args) < 2: return await message.reply("Gunakan: <code>/bililogout [nama_akun]</code>")
-    name = args[1].strip()
-    cookie_path = get_cookie_path(name)
-    if cookie_path.exists():
-        cookie_path.unlink()
-        await message.reply(f"✅ Akun <b>{name}</b> dihapus.")
-    else:
-        await message.reply(f"❌ Akun <b>{name}</b> tidak ada.")
-
-@new_task
-async def bili_set_cmd(client, message: Message):
-    text = message.text or message.caption or ""
-    args = text.split(maxsplit=2)
-    settings = load_settings()
-    if len(args) < 3: 
-        return await message.reply("Cara pakai:\n/biliset tags anime,gaming\n/biliset mode all\n/biliset prefix Judul")
-    
-    key, val = args[1].lower(), args[2].strip()
-    
-    if key == "tags":
-        settings["tags"] = [t.strip().lstrip("#") for t in val.split(",") if t.strip()]
-        await message.reply(f"✅ Tags diset: {' '.join(f'#{t}' for t in settings['tags'])}")
-    elif key == "mode":
-        if val not in ("all", "round_robin"): return await message.reply("❌ Mode harus 'all' atau 'round_robin'")
-        settings["account_mode"] = val
-        await message.reply(f"✅ Mode akun diset: <b>{val}</b>")
-    elif key == "prefix":
-        settings["title_prefix"] = val
-        await message.reply(f"✅ Prefix judul diset: {val}")
-    elif key == "desc":
-        settings["desc"] = val
-        await message.reply(f"✅ Deskripsi default diset: {val}")
-    else:
-        return await message.reply(f"❌ Pengaturan '{key}' tidak dikenali.")
-        
-    save_settings(settings)
-
-
-# ─────────────────────────────────────────────
-#  CORE UPLOAD LOGIC
-# ─────────────────────────────────────────────
-
-def _download_from_url(url: str) -> tuple[str | None, str | None]:
-    try:
-        filename = url.rstrip("/").split("/")[-1].split("?")[0] or f"vid_{int(time.time())}.mp4"
-        tmp_path = f"/tmp/{filename}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            with open(tmp_path, "wb") as f:
-                while True:
-                    chunk = resp.read(1024 * 1024)
-                    if not chunk: break
-                    f.write(chunk)
-        return tmp_path, None
-    except Exception as e:
-        return None, str(e)
-
-async def _do_upload_playwright(video_path: str, account: dict, title: str, tags: str, desc: str, custom_cover: str = None) -> tuple[bool, str]:
-    import httpx
-    try:
-        cookies = json.loads(Path(account["path"]).read_text())
-        if isinstance(cookies, list):
-            cookies = {c["name"]: c["value"] for c in cookies}
-    except Exception as e: return False, f"Error cookie: {e}"
-
-    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    filename = Path(video_path).name
-    filesize = Path(video_path).stat().st_size
-
-    base_headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Mobile Safari/537.36",
-        "Origin": "https://studio.bilibili.tv",
-        "Referer": "https://studio.bilibili.tv/",
-        "Cookie": cookie_header,
-    }
-
-    CHUNK_SIZE = 10 * 1024 * 1024
-
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        # 1. Preupload
-        r = await client.get(
-            "https://api.bilibili.tv/preupload",
-            params={"name": filename, "size": filesize, "r": "upos", "profile": "iup/bup", "ssl": "0", "version": "2.10.0", "build": "2100000", "biz": "UGC"},
-            headers=base_headers,
-        )
-        pre = r.json()
-        if pre.get("OK") != 1: return False, f"Preupload error: {pre}"
-
-        upload_url = pre["endpoint"] + pre["upos_uri"].replace("upos://", "/")
-        if upload_url.startswith("//"): upload_url = "https:" + upload_url
-        upos_headers = {**base_headers, "X-Upos-Auth": pre["auth"], "Content-Type": "application/octet-stream"}
-
-        # 2. Init
-        r = await client.post(upload_url, params={"uploads": "", "output": "json"}, headers={**upos_headers, "Content-Type": "application/json"}, content=b"")
-        upload_id = r.json().get("upload_id") or r.json().get("uploadId")
-
-        # 3. Chunks
-        total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
-        parts = []
-        with open(video_path, "rb") as f:
-            for chunk_idx in range(total_chunks):
-                start, end = chunk_idx * CHUNK_SIZE, min((chunk_idx + 1) * CHUNK_SIZE, filesize)
-                f.seek(start)
-                chunk_data = f.read(end - start)
-                for attempt in range(3):
-                    try:
-                        r = await client.put(upload_url, params={"partNumber": chunk_idx+1, "uploadId": upload_id, "chunk": chunk_idx, "chunks": total_chunks, "size": end-start, "start": start, "end": end, "total": filesize}, content=chunk_data, headers=upos_headers, timeout=600)
-                        if r.status_code in (200, 204): break
-                    except Exception:
-                        if attempt == 2: return False, f"Gagal upload chunk {chunk_idx+1}"
-                        await asyncio.sleep(3)
-                parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
-
-        # 4. Complete
-        r = await client.post(upload_url, params={"output": "json", "name": filename, "profile": "iup/bup", "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")), "biz": "UGC"}, json={"parts": parts}, headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"}, timeout=60)
-        complete_data = r.json()
-
-        # 5. Submit
-        video_key = complete_data.get("key", "").strip("/")
-        filename_only = video_key.replace(".mp4", "")
-
-        submit_params = {
-            "lang_id": "3",
-            "platform": "web",
-            "lang": "en_US",
-            "s_locale": "en_US",
-            "timezone": "GMT+07:00",
-            "csrf": cookies.get("bili_jct", "") or cookies.get("joy_jct", "")
-        }
-
-        final_cover = custom_cover if custom_cover else "https://p.bstarstatic.com/ugc/a81bfcb06c220955768404166a1f856b.jpg"
-
-        submit_data = {
-            "title": title[:80],
-            "cover": final_cover,
-            "desc": desc,
-            "no_reprint": True,
-            "filename": filename_only,
-            "playlist_id": "",
-            "visibility": 0,
-            "subtitle_id": None,
-            "subtitle_lang_id": None,
-            "from_spmid": "333.1011",
-            "copyright": 1,
-            "tag": tags or "anime"
-        }
-
-        try:
-            r = await client.post("https://api.bilibili.tv/intl/videoup/web2/add", params=submit_params, json=submit_data, headers={**base_headers, "Content-Type": "application/json"}, timeout=60)
-            
-            try:
-                res = r.json()
-            except Exception:
-                return False, f"API Error (Kena limit Bilibili): {r.status_code}"
-                
-            LOGGER.info(f"[bili.tv] final submit: {res}")
-            if res.get("code") == 0: return True, "Upload & Submit Berhasil! ✅"
-            return False, f"Submit gagal: {res}"
-        except Exception as e:
-            return False, f"Submit Exception: {e}"
-
-
-# ─────────────────────────────────────────────
-#  HANDLER UPLOAD VIDEO (DENGAN SISTEM ANTREAN)
-# ─────────────────────────────────────────────
-
-@new_task
-async def bili_upload_cmd(client, message: Message):
-    accounts = [a for a in list_accounts() if a["valid"]]
-    if not accounts: return await message.reply("❌ Belum ada akun Bilibili valid!")
-
-    settings = load_settings()
-    text = message.text or message.caption or ""
-    args = text.split(maxsplit=1)
-    if len(args) < 2: return await message.reply("❌ Format: <code>/biliupload &lt;url_video&gt; | &lt;judul&gt; | &lt;deskripsi&gt; | &lt;url_cover&gt;</code>")
-
-    parts = [p.strip() for p in args[1].strip().split("|")]
-    
-    url = parts[0]
-    custom_title = parts[1] if len(parts) > 1 and parts[1] else None
-    custom_desc  = parts[2] if len(parts) > 2 and parts[2] else None
-    custom_cover = parts[3] if len(parts) > 3 and parts[3] else None
-
-    if not url.startswith("http"):
-        await message.reply("❌ URL video tidak valid.")
-        return
-
-    url_filename = url.rstrip("/").split("/")[-1].split("?")[0]
-    url_stem = url_filename.rsplit(".", 1)[0] if "." in url_filename else url_filename
-
-    title = custom_title or url_stem
-    if settings.get("title_prefix"): title = f"{settings['title_prefix']} {title}"
-
-    desc = custom_desc or settings.get("desc", "")
-    tags_str = ",".join(settings.get("tags", []))
-    valid_accs = [a for a in accounts if a["valid"]]
-
-    if not valid_accs:
-        await message.reply("❌ Semua cookie tidak valid. Login ulang.")
-        return
-
-    if settings.get("account_mode", "round_robin") == "all":
-        target_accounts = valid_accs
-    else:
-        target_accounts = [valid_accs[int(time.time()) % len(valid_accs)]]
-
-    # Cek apakah sedang ada antrean berjalan
-    if bili_upload_lock.locked():
-        status_msg = await message.reply(f"⏳ <b>Menunggu antrean upload...</b>\n📝 {title}")
-    else:
-        status_msg = await message.reply(f"🔄 Memulai proses...\n📝 {title}")
-
-    # ===== GEMBOK ANTREAN DIBUKA DI SINI =====
-    async with bili_upload_lock:
+    if link.startswith("http"):
         await status_msg.edit(
-            f"⬇️ <b>Mendownload video...</b>\n\n"
-            f"📝 Judul: {title}\n"
-            f"🖼 Cover: {'Custom URL' if custom_cover else 'Default'}"
+            f"✅ <b>Upload ke {host.capitalize()} selesai!</b>\n\n"
+            f"📁 {os.path.basename(dest)} ({size_str})\n"
+            f"🔗 {link}"
         )
-        
-        video_path, err = await asyncio.to_thread(_download_from_url, url)
-        if not video_path: return await status_msg.edit(f"❌ <b>Download gagal:</b> {err}")
-
-        results = []
-        try:
-            for i, acc in enumerate(target_accounts):
-                await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar, antrian sedang diproses...")
-                
-                ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover)
-                emoji = "✅" if ok else "❌"
-                results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
-                
-                if i < len(target_accounts) - 1:
-                    await asyncio.sleep(3)
-                    
-        finally:
-            if video_path and os.path.exists(video_path): os.unlink(video_path)
-
-        await status_msg.edit(f"📊 <b>Hasil Upload</b>\n📝 {title}\n\n" + "\n".join(results))
-    # ===== GEMBOK ANTREAN DITUTUP, VIDEO SELANJUTNYA JALAN =====
-
-
-@new_task
-async def bili_cancel_cmd(client, message: Message):
-    user_id = message.from_user.id
-    if user_id in _login_sessions:
-        del _login_sessions[user_id]
-        await message.reply("✅ Sesi batal.")
     else:
-        await message.reply("Tidak ada sesi aktif.")
-
-@new_task
-async def bili_callback(client, query: CallbackQuery):
-    if query.data == "bili_new_login":
-        await query.answer(); await query.message.reply("Gunakan: <code>/bililogin akun1</code>")
-    elif query.data == "bili_settings":
-        await query.answer(); await query.message.reply("Gunakan: /biliset")
+        await status_msg.edit(link)
 
 
-# ─────────────────────────────────────────────
-#  REGISTRATION
-# ─────────────────────────────────────────────
-
-TgClient.bot.add_handler(MessageHandler(bili_login_cmd, filters=filters.command("bililogin") & CustomFilters.authorized))
-TgClient.bot.add_handler(MessageHandler(bili_receive_cookie_file, filters=filters.document & CustomFilters.authorized))
-TgClient.bot.add_handler(MessageHandler(bili_accounts_cmd, filters=filters.command("biliaccounts") & CustomFilters.authorized))
-TgClient.bot.add_handler(MessageHandler(bili_logout_cmd, filters=filters.command("bililogout") & CustomFilters.authorized))
-TgClient.bot.add_handler(MessageHandler(bili_set_cmd, filters=filters.command("biliset") & CustomFilters.authorized))
-TgClient.bot.add_handler(MessageHandler(bili_upload_cmd, filters=filters.command("biliupload") & CustomFilters.authorized))
-TgClient.bot.add_handler(MessageHandler(bili_cancel_cmd, filters=filters.command("bilicancel") & CustomFilters.authorized))
-TgClient.bot.add_handler(CallbackQueryHandler(bili_callback, filters=filters.regex(r"^bili_")))
-
-LOGGER.info("bilibili_login: ✅ semua handler berhasil didaftarkan")
+# ── Register handlers ─────────────────────────────────────────────────────────
+TgClient.bot.add_handler(
+    MessageHandler(set_api_key_cmd, filters=command(SET_HOST_LIST) & CustomFilters.sudo)
+)
+TgClient.bot.add_handler(
+    MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized)
+)
