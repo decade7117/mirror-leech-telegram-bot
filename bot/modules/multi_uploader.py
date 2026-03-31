@@ -111,7 +111,6 @@ def _download_url(url: str, dest: str, user_id: int):
             r.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
-                    # Cek jika dibatalkan
                     if _CANCEL_TASKS.get(user_id):
                         return False, "Dibatalkan oleh pengguna (/cancelup)."
                     f.write(chunk)
@@ -216,18 +215,14 @@ def _upload_filemirage(path: str, key: str, user_id: int) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (Menggunakan Playwright - Async NATIVE) ───────────────
+# ── Upload: Transfer.it (Playwright dengan Live Progress, Tanpa Screenshot) ──
 async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
-    """
-    Karena menggunakan async_playwright, fungsi ini dibuat native async agar bisa 
-    mengedit pesan Telegram (status_msg) untuk menampilkan waktu berjalan & merespon /cancelup
-    """
     from playwright.async_api import async_playwright
     from .. import LOGGER
 
     LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
         page = await context.new_page()
         try:
@@ -236,36 +231,53 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
             await page.locator("input[type='file']").first.set_input_files(path)
             await page.wait_for_timeout(2000)
             
+            # Memastikan kotak TOS dicentang (kalau ada dan belum tercentang)
+            tos_checkbox = page.locator("input[type='checkbox']").first
+            if await tos_checkbox.count() > 0 and not await tos_checkbox.is_checked():
+                await tos_checkbox.check(force=True)
+                await page.wait_for_timeout(500)
+            
             transfer_btn = page.locator("button:has-text('Transfer'):visible").first
             await transfer_btn.wait_for(state="visible", timeout=15000)
             await transfer_btn.click()
             
             wait_time = 0
-            # Loop cek selesai atau batal
             while True:
                 if _CANCEL_TASKS.get(user_id):
                     return "❌ Dibatalkan oleh pengguna (/cancelup)."
 
-                # Cek apakah tulisan Completed sudah muncul
+                # Cek apakah sukses
                 if await page.locator("text='Completed!':visible").first.is_visible():
                     break
 
-                await asyncio.sleep(2)
-                wait_time += 2
+                await asyncio.sleep(5)
+                wait_time += 5
 
-                # Update UI Telegram tiap 10 detik agar tidak kena limit
+                # Update progress setiap 10 detik
                 if wait_time % 10 == 0:
+                    prog_text = ""
                     try:
-                        await status_msg.edit(
-                            f"⬆️ Mengupload ke <b>Transfer.it</b> (Via Playwright)…\n"
-                            f"⏳ Waktu berjalan: <b>{wait_time} detik</b>\n\n"
-                            f"<i>Gunakan /cancelup untuk membatalkan</i>"
-                        )
+                        prog_loc = page.locator("text=/Uploading.*/i").first
+                        if await prog_loc.count() > 0 and await prog_loc.is_visible():
+                            prog_text = await prog_loc.inner_text()
                     except Exception:
-                        pass # Abaikan jika teks sama
+                        pass
+                        
+                    try:
+                        msg = f"⬆️ Mengupload ke <b>Transfer.it</b> (Via Playwright)…\n"
+                        msg += f"⏳ Waktu berjalan: <b>{wait_time} detik</b>\n"
+                        if prog_text:
+                            msg += f"📊 <code>{prog_text}</code>\n\n"
+                        else:
+                            msg += "📊 <i>Memproses enkripsi / upload...</i>\n\n"
+                        msg += "<i>Gunakan /cancelup untuk membatalkan</i>"
+                        
+                        await status_msg.edit(msg)
+                    except Exception:
+                        pass
 
-                if wait_time > 3600:
-                    return "❌ Timeout! Upload memakan waktu lebih dari 1 jam."
+                if wait_time > 7200: # Timeout maksimal 2 jam
+                    return "❌ Timeout! Upload memakan waktu lebih dari 2 jam."
 
             LOGGER.info("[Transfer.it] Mengambil link...")
             link_element = page.locator("input[readonly]:visible").first
@@ -277,6 +289,7 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
                 return await alt_link.input_value()
                 
             return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
+            
         except Exception as e:
             err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
             LOGGER.error(err_msg)
@@ -404,7 +417,7 @@ async def set_api_key_cmd(_, message):
             "player4me":  "API_TOKEN (dari player4me.com/account/api)",
             "akirabox":   "API_KEY",
             "buzzheavier":"API_KEY (opsional)",
-            "transferit": "tidak butuh API_KEY",
+            "transferit": "Tidak butuh API KEY (Guest Upload)",
         }
         await message.reply(f"Gunakan: <code>/set{host} {hints.get(host, 'API_KEY')}</code>")
         return
@@ -423,7 +436,6 @@ async def multi_mirror_cmd(_, message):
     host  = parts[0].lstrip("/").lower()
     user_id = message.from_user.id
     
-    # Reset flag cancel setiap kali command baru dijalankan
     _CANCEL_TASKS[user_id] = False
 
     func = _UPLOAD_FUNCS.get(host)
@@ -497,9 +509,7 @@ async def multi_mirror_cmd(_, message):
                     for f in files[:10]:
                         files_list.append(f"• <code>{f}</code>")
             hint = "\n".join(files_list) if files_list else "<i>Folder downloads kosong</i>"
-            await status_msg.edit(
-                f"❌ File <code>{arg}</code> tidak ditemukan.\n\nFile tersedia:\n{hint}"
-            )
+            await status_msg.edit(f"❌ File <code>{arg}</code> tidak ditemukan.\n\nFile tersedia:\n{hint}")
             return
         dest = found
 
@@ -510,17 +520,14 @@ async def multi_mirror_cmd(_, message):
 
     key  = _API_KEYS.get(host, "")
     
-    # Cek apakah fungsi ini native async (seperti transferit) atau sync
     if inspect.iscoroutinefunction(func):
         link = await func(dest, key, user_id, status_msg)
     else:
         link = await to_thread(func, dest, key, user_id)
 
     if need_del:
-        try:
-            os.remove(dest)
-        except Exception:
-            pass
+        try: os.remove(dest)
+        except Exception: pass
 
     if link.startswith("http"):
         await status_msg.edit(
@@ -533,12 +540,6 @@ async def multi_mirror_cmd(_, message):
 
 
 # ── Register handlers ─────────────────────────────────────────────────────────
-TgClient.bot.add_handler(
-    MessageHandler(set_api_key_cmd, filters=command(SET_HOST_LIST) & CustomFilters.sudo)
-)
-TgClient.bot.add_handler(
-    MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized)
-)
-TgClient.bot.add_handler(
-    MessageHandler(cancel_upload_cmd, filters=command("cancelup") & CustomFilters.authorized)
-)
+TgClient.bot.add_handler(MessageHandler(set_api_key_cmd, filters=command(SET_HOST_LIST) & CustomFilters.sudo))
+TgClient.bot.add_handler(MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized))
+TgClient.bot.add_handler(MessageHandler(cancel_upload_cmd, filters=command("cancelup") & CustomFilters.authorized))
