@@ -4,22 +4,26 @@
  FITUR:
  - /gofile, /pixeldrain, /buzzheavier, /filemirage, /player4me, /akirabox
  - /transferit     → download video dari URL dan upload ke transfer.it (via Playwright)
+ - /cancelup       → Membatalkan proses download/upload yang sedang berjalan
 ============================================================
 """
 
 import math
 import os
+import inspect
 import urllib.parse
 from asyncio import to_thread
+import asyncio
 
 from pyrogram.filters import command
 from pyrogram.handlers import MessageHandler
+from pyrogram.types import Message
 
 from ..core.telegram_manager import TgClient
 from ..helper.ext_utils.bot_utils import new_task
 from ..helper.telegram_helper.filters import CustomFilters
 
-# ── In-memory API key store ───────────────────────────────────────────────────
+# ── In-memory API key store & Cancel Flag ─────────────────────────────────────
 _API_KEYS: dict = {
     "gofile":      "",
     "pixeldrain":  "",
@@ -29,6 +33,9 @@ _API_KEYS: dict = {
     "player4me":   "",
     "akirabox":    "",
 }
+
+# Menyimpan status pembatalan per user
+_CANCEL_TASKS: dict = {}
 
 HOST_LIST     = list(_API_KEYS.keys())
 SET_HOST_LIST = [f"set{h}" for h in HOST_LIST]
@@ -72,8 +79,7 @@ async def _db_save_keys():
 
 from .. import LOGGER as _LOGGER
 try:
-    import asyncio as _asyncio
-    _loop = _asyncio.get_event_loop()
+    _loop = asyncio.get_event_loop()
     if _loop.is_running():
         _loop.create_task(_db_load_keys())
     else:
@@ -98,13 +104,16 @@ def _sizeof_fmt(num_bytes: int) -> str:
     if num_bytes >= 1024 ** 2: return f"{num_bytes / 1024 ** 2:.1f} MB"
     return f"{num_bytes / 1024:.1f} KB"
 
-def _download_url(url: str, dest: str):
+def _download_url(url: str, dest: str, user_id: int):
     import requests
     try:
         with requests.get(url, stream=True, timeout=600) as r:
             r.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
+                    # Cek jika dibatalkan
+                    if _CANCEL_TASKS.get(user_id):
+                        return False, "Dibatalkan oleh pengguna (/cancelup)."
                     f.write(chunk)
         return True, None
     except Exception as e:
@@ -121,8 +130,9 @@ def _find_file_in_downloads(name: str):
 
 
 # ── Upload: Gofile ────────────────────────────────────────────────────────────
-def _upload_gofile(path: str, key: str) -> str:
+def _upload_gofile(path: str, key: str, user_id: int) -> str:
     import requests
+    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
         with open(path, "rb") as f:
@@ -136,8 +146,9 @@ def _upload_gofile(path: str, key: str) -> str:
 
 
 # ── Upload: Pixeldrain ────────────────────────────────────────────────────────
-def _upload_pixeldrain(path: str, key: str) -> str:
+def _upload_pixeldrain(path: str, key: str, user_id: int) -> str:
     import requests
+    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         auth = ("", key) if key else None
         with open(path, "rb") as f:
@@ -150,8 +161,9 @@ def _upload_pixeldrain(path: str, key: str) -> str:
 
 
 # ── Upload: Buzzheavier ───────────────────────────────────────────────────────
-def _upload_buzzheavier(path: str, key: str) -> str:
+def _upload_buzzheavier(path: str, key: str, user_id: int) -> str:
     import requests
+    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         fname   = urllib.parse.quote(os.path.basename(path), safe="")
         headers = {"Authorization": f"Bearer {key}"} if key else {}
@@ -169,7 +181,7 @@ def _upload_buzzheavier(path: str, key: str) -> str:
 
 
 # ── Upload: Filemirage ────────────────────────────────────────────────────────
-def _upload_filemirage(path: str, key: str) -> str:
+def _upload_filemirage(path: str, key: str, user_id: int) -> str:
     import requests
     CHUNK_SIZE = 100 * 1024 * 1024
     headers    = {"Authorization": f"Bearer {key}"} if key else {}
@@ -188,6 +200,7 @@ def _upload_filemirage(path: str, key: str) -> str:
 
         with open(path, "rb") as fh:
             for i in range(total_chunks):
+                if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
                 chunk_data = fh.read(CHUNK_SIZE)
                 is_last    = (i == total_chunks - 1)
                 up_r = requests.post(upload_url, headers=headers, files={"file": (filename, chunk_data, "application/octet-stream")}, data={"filename": filename, "upload_id": upload_id, "chunk_number": str(i), "total_chunks": str(total_chunks)}, timeout=600)
@@ -203,69 +216,80 @@ def _upload_filemirage(path: str, key: str) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (Menggunakan Playwright) ──────────────────────────────
-def _upload_transferit(path: str, key: str) -> str:
+# ── Upload: Transfer.it (Menggunakan Playwright - Async NATIVE) ───────────────
+async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
     """
-    Fungsi ini berjalan sinkron untuk membungkus kode asinkron dari Playwright
-    agar kompatibel dengan arsitektur to_thread di multi_mirror_cmd
+    Karena menggunakan async_playwright, fungsi ini dibuat native async agar bisa 
+    mengedit pesan Telegram (status_msg) untuk menampilkan waktu berjalan & merespon /cancelup
     """
-    import asyncio
     from playwright.async_api import async_playwright
     from .. import LOGGER
 
-    async def _run_playwright():
-        LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-            page = await context.new_page()
-            try:
-                await page.goto("https://transfer.it/")
-                
-                # FIX: Tambahkan .first agar Playwright langsung memilih input file pertama
-                LOGGER.info("[Transfer.it] Memasukkan file...")
-                await page.locator("input[type='file']").first.set_input_files(path)
-                
-                # FIX: Beri jeda 2 detik agar animasi UI Transfer.it selesai memunculkan tombol
-                await page.wait_for_timeout(2000)
-                
-                LOGGER.info("[Transfer.it] Menekan tombol Transfer yang aktif...")
-                # FIX: Tambahkan pseudo-class ':visible' agar bot HANYA memilih tombol yang tampil di layar
-                transfer_btn = page.locator("button:has-text('Transfer'):visible").first
-                await transfer_btn.wait_for(state="visible", timeout=15000)
-                await transfer_btn.click()
-                
-                LOGGER.info("[Transfer.it] Menunggu proses upload selesai (Completed!)...")
-                # Sama seperti tombol, kita cari teks "Completed!" yang benar-benar visible
-                await page.locator("text='Completed!':visible").first.wait_for(state="visible", timeout=3600000)
+    LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+        page = await context.new_page()
+        try:
+            await page.goto("https://transfer.it/")
+            
+            await page.locator("input[type='file']").first.set_input_files(path)
+            await page.wait_for_timeout(2000)
+            
+            transfer_btn = page.locator("button:has-text('Transfer'):visible").first
+            await transfer_btn.wait_for(state="visible", timeout=15000)
+            await transfer_btn.click()
+            
+            wait_time = 0
+            # Loop cek selesai atau batal
+            while True:
+                if _CANCEL_TASKS.get(user_id):
+                    return "❌ Dibatalkan oleh pengguna (/cancelup)."
 
-                LOGGER.info("[Transfer.it] Mengambil link...")
-                # Cari input readonly yang visible
-                link_element = page.locator("input[readonly]:visible").first
-                if await link_element.count() > 0:
-                    return await link_element.input_value()
-                
-                # Alternatif jika input readonly tidak ada, kita coba cari berdasarkan value yang mengandung 'transfer.it'
-                alt_link = page.locator("input[value*='transfer.it']:visible").first
-                if await alt_link.count() > 0:
-                    return await alt_link.input_value()
-                    
-                return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
-            except Exception as e:
-                err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
-                LOGGER.error(err_msg)
-                return err_msg
-            finally:
-                await browser.close()
+                # Cek apakah tulisan Completed sudah muncul
+                if await page.locator("text='Completed!':visible").first.is_visible():
+                    break
 
-    return asyncio.run(_run_playwright())
+                await asyncio.sleep(2)
+                wait_time += 2
+
+                # Update UI Telegram tiap 10 detik agar tidak kena limit
+                if wait_time % 10 == 0:
+                    try:
+                        await status_msg.edit(
+                            f"⬆️ Mengupload ke <b>Transfer.it</b> (Via Playwright)…\n"
+                            f"⏳ Waktu berjalan: <b>{wait_time} detik</b>\n\n"
+                            f"<i>Gunakan /cancelup untuk membatalkan</i>"
+                        )
+                    except Exception:
+                        pass # Abaikan jika teks sama
+
+                if wait_time > 3600:
+                    return "❌ Timeout! Upload memakan waktu lebih dari 1 jam."
+
+            LOGGER.info("[Transfer.it] Mengambil link...")
+            link_element = page.locator("input[readonly]:visible").first
+            if await link_element.count() > 0:
+                return await link_element.input_value()
+            
+            alt_link = page.locator("input[value*='transfer.it']:visible").first
+            if await alt_link.count() > 0:
+                return await alt_link.input_value()
+                
+            return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
+        except Exception as e:
+            err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
+            LOGGER.error(err_msg)
+            return err_msg
+        finally:
+            await browser.close()
 
 
 # ── Upload: Player4me ─────────────────────────────────────────────────────────
 def _p4m_headers(key: str) -> dict:
     return {"api-token": key, "Accept": "application/json"}
 
-def _p4m_advance_upload_url(url: str, key: str, name: str = None) -> str:
+def _p4m_advance_upload_url(url: str, key: str, name: str, user_id: int) -> str:
     import requests
     import time
     headers = _p4m_headers(key)
@@ -281,6 +305,7 @@ def _p4m_advance_upload_url(url: str, key: str, name: str = None) -> str:
 
         max_wait, interval, waited = 1800, 15, 0
         while waited < max_wait:
+            if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna (/cancelup)."
             time.sleep(interval)
             waited += interval
             st_r = requests.get(f"{P4M_BASE}/api/v1/video/advance-upload/{task_id}", headers=headers, timeout=30)
@@ -299,7 +324,7 @@ def _p4m_advance_upload_url(url: str, key: str, name: str = None) -> str:
     except Exception as e:
         return f"❌ Player4me exception: {e}"
 
-def _p4m_tus_upload(path: str, key: str) -> str:
+def _p4m_tus_upload(path: str, key: str, user_id: int) -> str:
     import base64
     import requests
     headers, CHUNK = _p4m_headers(key), 52_428_800
@@ -323,6 +348,7 @@ def _p4m_tus_upload(path: str, key: str) -> str:
         offset = 0
         with open(path, "rb") as fh:
             while offset < file_size:
+                if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna (/cancelup)."
                 chunk = fh.read(CHUNK)
                 patch_r = requests.patch(upload_url, data=chunk, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": str(offset), "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(chunk)), "api-token": key}, timeout=600)
                 if patch_r.status_code not in (200, 204): return f"❌ Player4me TUS chunk gagal offset {offset}: HTTP {patch_r.status_code}"
@@ -334,14 +360,15 @@ def _p4m_tus_upload(path: str, key: str) -> str:
     except Exception as e:
         return f"❌ Player4me TUS exception: {e}"
 
-def _upload_player4me(path: str, key: str) -> str:
+def _upload_player4me(path: str, key: str, user_id: int) -> str:
     if not key: return "❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN"
-    return _p4m_tus_upload(path, key)
+    return _p4m_tus_upload(path, key, user_id)
 
 
 # ── Upload: Akirabox ──────────────────────────────────────────────────────────
-def _upload_akirabox(path: str, key: str) -> str:
+def _upload_akirabox(path: str, key: str, user_id: int) -> str:
     import requests
+    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         with open(path, "rb") as f:
             r = requests.post("https://akirabox.com/api/upload", files={"file": (os.path.basename(path), f)}, data={"api_key": key}, timeout=600)
@@ -385,11 +412,19 @@ async def set_api_key_cmd(_, message):
     await _db_save_keys()
     await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan ke database!")
 
+@new_task
+async def cancel_upload_cmd(_, message: Message):
+    _CANCEL_TASKS[message.from_user.id] = True
+    await message.reply("🛑 Permintaan pembatalan dikirim. Menunggu proses dihentikan...")
 
 @new_task
 async def multi_mirror_cmd(_, message):
     parts = message.text.strip().split(maxsplit=1)
     host  = parts[0].lstrip("/").lower()
+    user_id = message.from_user.id
+    
+    # Reset flag cancel setiap kali command baru dijalankan
+    _CANCEL_TASKS[user_id] = False
 
     func = _UPLOAD_FUNCS.get(host)
     if not func:
@@ -421,13 +456,13 @@ async def multi_mirror_cmd(_, message):
             return
         await status_msg.edit(
             f"📤 Mengirim URL ke server Player4me…\n"
-            f"(Server Player4me yang download filenya)\n"
             f"<code>{arg}</code>\n\n"
-            f"<i>Bot akan poll status setiap 15 detik…</i>"
+            f"<i>Gunakan /cancelup untuk membatalkan</i>"
         )
         fname = arg.split("/")[-1].split("?")[0].strip() or None
-        link  = await to_thread(_p4m_advance_upload_url, arg, key, fname)
-        await status_msg.edit(f"✅ <b>Upload ke Player4me selesai!</b>\n\n🔗 {link}")
+        link  = await to_thread(_p4m_advance_upload_url, arg, key, fname, user_id)
+        if "❌" in link: await status_msg.edit(link)
+        else: await status_msg.edit(f"✅ <b>Upload ke Player4me selesai!</b>\n\n🔗 {link}")
         return
 
     need_del = False
@@ -439,8 +474,8 @@ async def multi_mirror_cmd(_, message):
             fname = "file_download"
         os.makedirs(TEMP_DIR, exist_ok=True)
         dest = os.path.join(TEMP_DIR, fname)
-        await status_msg.edit(f"⬇️ Mengunduh file dari URL…\n<code>{arg}</code>")
-        ok, err = await to_thread(_download_url, arg, dest)
+        await status_msg.edit(f"⬇️ Mengunduh file dari URL…\n<code>{arg}</code>\n<i>Gunakan /cancelup untuk membatalkan</i>")
+        ok, err = await to_thread(_download_url, arg, dest, user_id)
         if not ok:
             await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
             return
@@ -470,13 +505,16 @@ async def multi_mirror_cmd(_, message):
 
     size_str = _sizeof_fmt(os.path.getsize(dest))
     
-    if host == "transferit":
-        await status_msg.edit(f"⬆️ Mengupload ke <b>Transfer.it</b> (Via Playwright)…\n⏳ Harap bersabar, proses ini memakan waktu\n📁 <code>{os.path.basename(dest)}</code> ({size_str})")
-    else:
-        await status_msg.edit(f"⬆️ Mengupload ke <b>{host.capitalize()}</b>…\n📁 <code>{os.path.basename(dest)}</code> ({size_str})")
+    if host != "transferit":
+        await status_msg.edit(f"⬆️ Mengupload ke <b>{host.capitalize()}</b>…\n📁 <code>{os.path.basename(dest)}</code> ({size_str})\n<i>Gunakan /cancelup untuk membatalkan</i>")
 
     key  = _API_KEYS.get(host, "")
-    link = await to_thread(func, dest, key)
+    
+    # Cek apakah fungsi ini native async (seperti transferit) atau sync
+    if inspect.iscoroutinefunction(func):
+        link = await func(dest, key, user_id, status_msg)
+    else:
+        link = await to_thread(func, dest, key, user_id)
 
     if need_del:
         try:
@@ -500,4 +538,7 @@ TgClient.bot.add_handler(
 )
 TgClient.bot.add_handler(
     MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized)
+)
+TgClient.bot.add_handler(
+    MessageHandler(cancel_upload_cmd, filters=command("cancelup") & CustomFilters.authorized)
 )
