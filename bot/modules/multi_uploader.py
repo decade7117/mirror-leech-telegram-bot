@@ -222,22 +222,34 @@ def _upload_transferit(path: str, key: str) -> str:
             try:
                 await page.goto("https://transfer.it/")
                 
-                # FIX: Menggunakan .first agar Playwright tidak bingung memilih elemen
+                # FIX: Tambahkan .first agar Playwright langsung memilih input file pertama
                 LOGGER.info("[Transfer.it] Memasukkan file...")
                 await page.locator("input[type='file']").first.set_input_files(path)
                 
-                LOGGER.info("[Transfer.it] Menekan tombol Transfer...")
-                transfer_btn = page.locator("button:has-text('Transfer')").first
+                # FIX: Beri jeda 2 detik agar animasi UI Transfer.it selesai memunculkan tombol
+                await page.wait_for_timeout(2000)
+                
+                LOGGER.info("[Transfer.it] Menekan tombol Transfer yang aktif...")
+                # FIX: Tambahkan pseudo-class ':visible' agar bot HANYA memilih tombol yang tampil di layar
+                transfer_btn = page.locator("button:has-text('Transfer'):visible").first
                 await transfer_btn.wait_for(state="visible", timeout=15000)
                 await transfer_btn.click()
                 
-                LOGGER.info("[Transfer.it] Menunggu proses upload selesai...")
-                await page.locator("text='Completed!'").first.wait_for(state="visible", timeout=3600000)
+                LOGGER.info("[Transfer.it] Menunggu proses upload selesai (Completed!)...")
+                # Sama seperti tombol, kita cari teks "Completed!" yang benar-benar visible
+                await page.locator("text='Completed!':visible").first.wait_for(state="visible", timeout=3600000)
 
                 LOGGER.info("[Transfer.it] Mengambil link...")
-                link_element = page.locator("input[readonly]").first
+                # Cari input readonly yang visible
+                link_element = page.locator("input[readonly]:visible").first
                 if await link_element.count() > 0:
                     return await link_element.input_value()
+                
+                # Alternatif jika input readonly tidak ada, kita coba cari berdasarkan value yang mengandung 'transfer.it'
+                alt_link = page.locator("input[value*='transfer.it']:visible").first
+                if await alt_link.count() > 0:
+                    return await alt_link.input_value()
+                    
                 return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
             except Exception as e:
                 err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
