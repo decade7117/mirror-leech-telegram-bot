@@ -46,7 +46,7 @@ DEFAULT_SETTINGS = {
 }
 
 _login_sessions: dict = {}
-_CANCEL_BILI: dict = {}  # Flag untuk membatalkan proses upload
+_CANCEL_BILI: dict = {}
 bili_upload_lock = asyncio.Lock()
 
 def load_settings() -> dict:
@@ -113,22 +113,30 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
 
     CHUNK_SIZE = 10 * 1024 * 1024
 
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
+        # 1. Preupload
         try:
             r = await client.get("https://api.bilibili.tv/preupload", params={"name": filename, "size": filesize, "r": "upos", "profile": "iup/bup", "ssl": "0", "version": "2.10.0", "build": "2100000", "biz": "UGC"}, headers=base_headers)
             pre = r.json()
             if pre.get("OK") != 1: return False, f"Preupload error: {pre}"
-        except Exception as e: return False, f"Preupload timeout/error: {e}"
+        except Exception as e: return False, f"Preupload error: {e}"
 
         upload_url = pre["endpoint"] + pre["upos_uri"].replace("upos://", "/")
         if upload_url.startswith("//"): upload_url = "https:" + upload_url
         upos_headers = {**base_headers, "X-Upos-Auth": pre["auth"], "Content-Type": "application/octet-stream"}
 
-        try:
-            r = await client.post(upload_url, params={"uploads": "", "output": "json"}, headers={**upos_headers, "Content-Type": "application/json"}, content=b"")
-            upload_id = r.json().get("upload_id") or r.json().get("uploadId")
-        except Exception as e: return False, f"Init upload timeout: {e}"
+        # 2. Init (DENGAN SISTEM RETRY ANTI-TIMEOUT)
+        upload_id = None
+        for attempt in range(1, 4):
+            try:
+                r = await client.post(upload_url, params={"uploads": "", "output": "json"}, headers={**upos_headers, "Content-Type": "application/json"}, content=b"")
+                upload_id = r.json().get("upload_id") or r.json().get("uploadId")
+                if upload_id: break
+            except Exception as e:
+                if attempt == 3: return False, f"Init upload timeout setelah 3x coba: {e}"
+                await asyncio.sleep(2) # Jeda sebelum coba lagi
 
+        # 3. Chunks
         total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
         parts = []
         with open(video_path, "rb") as f:
@@ -143,15 +151,17 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
                         r = await client.put(upload_url, params={"partNumber": chunk_idx+1, "uploadId": upload_id, "chunk": chunk_idx, "chunks": total_chunks, "size": end-start, "start": start, "end": end, "total": filesize}, content=chunk_data, headers=upos_headers, timeout=120)
                         if r.status_code in (200, 204): break
                     except Exception:
-                        if attempt == 2: return False, f"Gagal upload chunk {chunk_idx+1} (Timeout)"
+                        if attempt == 2: return False, f"Gagal upload chunk {chunk_idx+1}"
                         await asyncio.sleep(3)
                 parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
 
+        # 4. Complete
         try:
             r = await client.post(upload_url, params={"output": "json", "name": filename, "profile": "iup/bup", "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")), "biz": "UGC"}, json={"parts": parts}, headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"}, timeout=60)
             complete_data = r.json()
-        except Exception as e: return False, f"Complete upload error: {e}"
+        except Exception as e: return False, f"Complete error: {e}"
 
+        # 5. Submit
         video_key = complete_data.get("key", "").strip("/")
         filename_only = video_key.replace(".mp4", "")
         submit_params = {"lang_id": "3", "platform": "web", "lang": "en_US", "s_locale": "en_US", "timezone": "GMT+07:00", "csrf": cookies.get("bili_jct", "") or cookies.get("joy_jct", "")}
@@ -274,7 +284,6 @@ async def bili_upload_cmd(client, message: Message):
 
     user_id = message.from_user.id
     _CANCEL_BILI[user_id] = False
-
     settings = load_settings()
     text = message.text or message.caption or ""
     args = text.split(maxsplit=1)
@@ -308,9 +317,8 @@ async def bili_upload_cmd(client, message: Message):
         try:
             for i, acc in enumerate(target_accounts):
                 if _CANCEL_BILI.get(user_id):
-                    results.append("🛑 Upload dibatalkan secara manual.")
+                    results.append("🛑 Upload dibatalkan manual.")
                     break
-
                 await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar...\n<i>Gunakan /cancelbili untuk batal</i>")
                 ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id)
                 results.append(f"{'✅' if ok else '❌'} <b>{acc['name']}</b>: {detail}")
