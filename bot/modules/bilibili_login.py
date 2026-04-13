@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 import urllib.request
 from pathlib import Path
 
@@ -47,6 +48,7 @@ DEFAULT_SETTINGS = {
 
 _login_sessions: dict = {}
 _CANCEL_BILI: dict = {}
+_RETRY_TASKS: dict = {}  # Menyimpan memori akun yang gagal untuk di-retry
 bili_upload_lock = asyncio.Lock()
 
 def load_settings() -> dict:
@@ -134,7 +136,7 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
                 if upload_id: break
             except Exception as e:
                 if attempt == 3: return False, f"Init upload timeout setelah 3x coba: {e}"
-                await asyncio.sleep(2) # Jeda sebelum coba lagi
+                await asyncio.sleep(2)
 
         # 3. Chunks
         total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -176,6 +178,39 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
             return False, f"Submit gagal: {res}"
         except Exception as e:
             return False, f"Submit Exception: {e}"
+
+async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_cover, target_accounts, user_id):
+    """Core logic untuk mendownload dan melakukan looping upload ke akun (bisa dipanggil untuk fresh upload maupun retry)"""
+    await status_msg.edit(f"⬇️ <b>Mendownload video...</b>\n📝 Judul: {title}\n🖼 Cover: {'Custom URL' if custom_cover else 'Default'}\n<i>Gunakan /cancelbili untuk batal</i>")
+    video_path, err = await asyncio.to_thread(_download_from_url, url, user_id)
+    if not video_path: 
+        await status_msg.edit(f"❌ <b>Download gagal/Batal:</b> {err}")
+        return None, None
+
+    results = []
+    failed_accounts = []
+    
+    try:
+        for i, acc in enumerate(target_accounts):
+            if _CANCEL_BILI.get(user_id):
+                results.append("🛑 Upload dibatalkan manual.")
+                break
+            
+            await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar...\n<i>Gunakan /cancelbili untuk batal</i>")
+            ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id)
+            
+            emoji = "✅" if ok else "❌"
+            results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
+            
+            # Jika gagal, catat akunnya untuk di-retry
+            if not ok:
+                failed_accounts.append(acc)
+                
+            if i < len(target_accounts) - 1: await asyncio.sleep(3)
+    finally:
+        if video_path and os.path.exists(video_path): os.unlink(video_path)
+
+    return results, failed_accounts
 
 @new_task
 async def bili_login_cmd(client, message: Message):
@@ -309,24 +344,24 @@ async def bili_upload_cmd(client, message: Message):
     else: status_msg = await message.reply(f"🔄 Memulai proses Bilibili...\n📝 {title}")
 
     async with bili_upload_lock:
-        await status_msg.edit(f"⬇️ <b>Mendownload video...</b>\n📝 Judul: {title}\n🖼 Cover: {'Custom URL' if custom_cover else 'Default'}\n<i>Gunakan /cancelbili untuk batal</i>")
-        video_path, err = await asyncio.to_thread(_download_from_url, url, user_id)
-        if not video_path: return await status_msg.edit(f"❌ <b>Download gagal/Batal:</b> {err}")
+        results, failed_accounts = await _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_cover, target_accounts, user_id)
 
-        results = []
-        try:
-            for i, acc in enumerate(target_accounts):
-                if _CANCEL_BILI.get(user_id):
-                    results.append("🛑 Upload dibatalkan manual.")
-                    break
-                await status_msg.edit(f"🚀 <b>Mengupload ke BiliTV ({i+1}/{len(target_accounts)})...</b>\n👤 Akun: <b>{acc['name']}</b>\n⏳ Harap bersabar...\n<i>Gunakan /cancelbili untuk batal</i>")
-                ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id)
-                results.append(f"{'✅' if ok else '❌'} <b>{acc['name']}</b>: {detail}")
-                if i < len(target_accounts) - 1: await asyncio.sleep(3)
-        finally:
-            if video_path and os.path.exists(video_path): os.unlink(video_path)
+    if results is None: return  # Jika download gagal / dibatalkan
 
-        await status_msg.edit(f"📊 <b>Hasil Upload Bilibili</b>\n📝 {title}\n\n" + "\n".join(results))
+    text_result = f"📊 <b>Hasil Upload Bilibili</b>\n📝 {title}\n\n" + "\n".join(results)
+
+    if failed_accounts:
+        # Simpan memori untuk di-retry
+        task_id = str(uuid.uuid4())[:8]
+        _RETRY_TASKS[task_id] = {
+            "url": url, "title": title, "desc": desc, "tags_str": tags_str, 
+            "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id
+        }
+        
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Ulangi yang Gagal", callback_data=f"bili_retry_{task_id}")]])
+        await status_msg.edit(text_result, reply_markup=reply_markup)
+    else:
+        await status_msg.edit(text_result)
 
 @new_task
 async def bili_cancel_cmd(client, message: Message):
@@ -342,6 +377,45 @@ async def bili_callback(client, query: CallbackQuery):
         await query.answer(); await query.message.reply("Gunakan: <code>/bililogin akun1</code>")
     elif query.data == "bili_settings":
         await query.answer(); await query.message.reply("Gunakan: /biliset")
+    
+    # HANDLER UNTUK TOMBOL RETRY
+    elif query.data.startswith("bili_retry_"):
+        task_id = query.data.split("_")[-1]
+        task = _RETRY_TASKS.get(task_id)
+        
+        if not task:
+            return await query.answer("❌ Data retry sudah kedaluwarsa atau bot baru direstart.", show_alert=True)
+            
+        await query.answer("🔄 Memulai ulang akun yang gagal...")
+        
+        url = task["url"]
+        title = task["title"]
+        desc = task["desc"]
+        tags_str = task["tags_str"]
+        custom_cover = task["custom_cover"]
+        target_accounts = task["failed_accounts"]
+        user_id = query.from_user.id
+        
+        _CANCEL_BILI[user_id] = False
+        
+        if bili_upload_lock.locked(): 
+            await query.message.edit(f"{query.message.text}\n\n⏳ <b>Menunggu antrean retry Bilibili...</b>")
+            
+        async with bili_upload_lock:
+            results, new_failed_accounts = await _core_bili_upload_loop(query.message, url, title, desc, tags_str, custom_cover, target_accounts, user_id)
+            
+        if results is None: return
+        
+        text_result = f"📊 <b>Hasil Retry Bilibili</b>\n📝 {title}\n\n" + "\n".join(results)
+        
+        if new_failed_accounts:
+            # Perbarui target_accounts dengan yang MASIH gagal saja
+            _RETRY_TASKS[task_id]["failed_accounts"] = new_failed_accounts
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Ulangi yang Gagal (Lagi)", callback_data=f"bili_retry_{task_id}")]])
+            await query.message.edit(text_result, reply_markup=markup)
+        else:
+            await query.message.edit(text_result)
+            _RETRY_TASKS.pop(task_id, None)  # Hapus memori kalau sudah sukses semua
 
 TgClient.bot.add_handler(MessageHandler(bili_login_cmd, filters=filters.command("bililogin") & CustomFilters.authorized))
 TgClient.bot.add_handler(MessageHandler(bili_receive_cookie_file, filters=filters.document & CustomFilters.authorized))
