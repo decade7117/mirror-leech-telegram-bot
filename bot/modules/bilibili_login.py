@@ -127,7 +127,7 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
         if upload_url.startswith("//"): upload_url = "https:" + upload_url
         upos_headers = {**base_headers, "X-Upos-Auth": pre["auth"], "Content-Type": "application/octet-stream"}
 
-        # 2. Init (DENGAN SISTEM RETRY ANTI-TIMEOUT)
+        # 2. Init
         upload_id = None
         for attempt in range(1, 4):
             try:
@@ -180,11 +180,11 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
             return False, f"Submit Exception: {e}"
 
 async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_cover, target_accounts, user_id):
-    """Core logic untuk mendownload dan melakukan looping upload ke akun (bisa dipanggil untuk fresh upload maupun retry)"""
+    """Core logic untuk mendownload dan melakukan looping upload ke akun"""
     await status_msg.edit(f"⬇️ <b>Mendownload video...</b>\n📝 Judul: {title}\n🖼 Cover: {'Custom URL' if custom_cover else 'Default'}\n<i>Gunakan /cancelbili untuk batal</i>")
     video_path, err = await asyncio.to_thread(_download_from_url, url, user_id)
     
-    # PERUBAHAN: Kembalikan target_accounts sebagai failed_accounts jika download gagal
+    # Jika download gagal, kembalikan target_accounts utuh supaya tersimpan di memori retry
     if not video_path: 
         return None, target_accounts, err
 
@@ -211,7 +211,6 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
     finally:
         if video_path and os.path.exists(video_path): os.unlink(video_path)
 
-    # PERUBAHAN: Kembalikan None untuk err jika sukses melewati tahap download
     return results, failed_accounts, None
 
 @new_task
@@ -346,23 +345,21 @@ async def bili_upload_cmd(client, message: Message):
     else: status_msg = await message.reply(f"🔄 Memulai proses Bilibili...\n📝 {title}")
 
     async with bili_upload_lock:
-        # PERUBAHAN: Menangkap 3 parameter balasan (results, failed_accounts, err_msg)
         results, failed_accounts, err_msg = await _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_cover, target_accounts, user_id)
 
-    # PERUBAHAN: Logika jika download gagal
+    # Logika jika PADA AWAL MULAI download langsung gagal
     if results is None:
         if _CANCEL_BILI.get(user_id):
             await status_msg.edit(f"🛑 <b>Download dibatalkan manual:</b> {err_msg}")
             return
             
-        # Simpan state untuk diretry
         task_id = str(uuid.uuid4())[:8]
         _RETRY_TASKS[task_id] = {
             "url": url, "title": title, "desc": desc, "tags_str": tags_str, 
             "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id
         }
         
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Ulangi Download & Upload", callback_data=f"bili_retry_{task_id}")]])
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Semua ({len(failed_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
         await status_msg.edit(f"❌ <b>Download gagal/Batal:</b> {err_msg}", reply_markup=reply_markup)
         return
 
@@ -375,7 +372,7 @@ async def bili_upload_cmd(client, message: Message):
             "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id
         }
         
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Ulangi yang Gagal", callback_data=f"bili_retry_{task_id}")]])
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi yang Gagal ({len(failed_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
         await status_msg.edit(text_result, reply_markup=reply_markup)
     else:
         await status_msg.edit(text_result)
@@ -395,14 +392,15 @@ async def bili_callback(client, query: CallbackQuery):
     elif query.data == "bili_settings":
         await query.answer(); await query.message.reply("Gunakan: /biliset")
     
+    # HANDLER UNTUK TOMBOL RETRY
     elif query.data.startswith("bili_retry_"):
         task_id = query.data.split("_")[-1]
         task = _RETRY_TASKS.get(task_id)
         
         if not task:
-            return await query.answer("❌ Data retry sudah kedaluwarsa atau bot baru direstart.", show_alert=True)
+            return await query.answer("❌ Data retry sudah kedaluwarsa atau bot direstart.", show_alert=True)
             
-        await query.answer("🔄 Memulai ulang proses yang gagal...")
+        await query.answer(f"🔄 Memulai ulang untuk {len(task['failed_accounts'])} akun...")
         
         url = task["url"]
         title = task["title"]
@@ -418,17 +416,16 @@ async def bili_callback(client, query: CallbackQuery):
             await query.message.edit(f"{query.message.text}\n\n⏳ <b>Menunggu antrean retry Bilibili...</b>")
             
         async with bili_upload_lock:
-            # PERUBAHAN: Menangkap 3 parameter balasan saat retry
             results, new_failed_accounts, err_msg = await _core_bili_upload_loop(query.message, url, title, desc, tags_str, custom_cover, target_accounts, user_id)
             
-        # PERUBAHAN: Logika jika download MASIH gagal saat di-retry
+        # Logika jika SAAT DI-RETRY, download-nya malah gagal lagi
         if results is None:
             if _CANCEL_BILI.get(user_id):
                 await query.message.edit(f"🛑 <b>Retry dibatalkan manual:</b> {err_msg}")
                 _RETRY_TASKS.pop(task_id, None)
                 return
                 
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Ulangi Download & Upload", callback_data=f"bili_retry_{task_id}")]])
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Download (Sisa {len(target_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
             await query.message.edit(f"❌ <b>Download gagal lagi:</b> {err_msg}", reply_markup=markup)
             return
         
@@ -436,7 +433,7 @@ async def bili_callback(client, query: CallbackQuery):
         
         if new_failed_accounts:
             _RETRY_TASKS[task_id]["failed_accounts"] = new_failed_accounts
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Ulangi yang Gagal (Lagi)", callback_data=f"bili_retry_{task_id}")]])
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Sisa {len(new_failed_accounts)} Akun Gagal", callback_data=f"bili_retry_{task_id}")]])
             await query.message.edit(text_result, reply_markup=markup)
         else:
             await query.message.edit(text_result)
