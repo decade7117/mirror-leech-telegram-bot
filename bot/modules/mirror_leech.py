@@ -344,10 +344,12 @@ class Mirror(TaskListener):
         # ==========================================
         # SUNTIKAN UI TOMBOL (PIKABOT STYLE)
         # ==========================================
-        if not self.up_dest and not self.is_leech: 
+        # Mengecek args["-up"] langsung untuk mem-bypass DEFAULT_UPLOAD sistem!
+        if not args["-up"] and not self.is_leech: 
             buttons = InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton("Drive / Rclone", callback_data=f"updest_{self.message.id}_default"),
+                    InlineKeyboardButton("Google Drive", callback_data=f"updest_{self.message.id}_gd"),
+                    InlineKeyboardButton("Rclone", callback_data=f"updest_{self.message.id}_rc")
                 ],
                 [
                     InlineKeyboardButton("GoFile", callback_data=f"updest_{self.message.id}_gofile"),
@@ -361,10 +363,10 @@ class Mirror(TaskListener):
             PENDING_UI_TASKS[self.message.id] = self 
 
             try:
-                # Skrip JEDA di sini maksimal 60 detik agar tidak nge-hang jika tidak diklik
+                # Skrip JEDA di sini maksimal 60 detik agar tidak nge-hang
                 await asyncio.wait_for(self.ui_event.wait(), timeout=60.0)
             except asyncio.TimeoutError:
-                self.up_dest = "" # Kembali ke default (Drive) jika timeout
+                pass # Biarkan jalan pakai up_dest dari DEFAULT_UPLOAD jika user tidak merespon
             finally:
                 if self.message.id in PENDING_UI_TASKS:
                     del PENDING_UI_TASKS[self.message.id]
@@ -439,16 +441,10 @@ async def ui_callback_handler(client, query):
         
         if msg_id in PENDING_UI_TASKS:
             task = PENDING_UI_TASKS[msg_id]
-            
-            if dest == "default":
-                task.up_dest = "" 
-            else:
-                task.up_dest = dest
-                
+            task.up_dest = dest # Timpa tujuan upload sistem dengan pilihan user!
             await query.answer(f"Tujuan diatur ke: {dest.upper()}")
             task.ui_event.set() 
         else:
             await query.answer("Waktu pilih sudah habis / Task tidak valid.", show_alert=True)
 
-# Daftarkan handler
 TgClient.bot.add_handler(CallbackQueryHandler(ui_callback_handler, filters=lambda _, q: q.data.startswith("updest_")))
