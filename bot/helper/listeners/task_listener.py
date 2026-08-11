@@ -302,7 +302,7 @@ class TaskListener(TaskConfig):
             )
             del tg
         # ==========================================
-        # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & AUTO-DELETE FIX
+        # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & ANTI-HANTU
         # ==========================================
         elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier"]:
             LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
@@ -312,11 +312,16 @@ class TaskListener(TaskConfig):
             import asyncio
             import urllib.parse
             
-            # ---> Hapus pesan 100% download agar tidak nyangkut saat upload <---
+            # ---> Basmi Hantu Pesan Pause 100% dengan Aman <---
             async with task_dict_lock:
                 if self.mid in task_dict:
                     del task_dict[self.mid]
-            await update_status_message(self.message.chat.id)
+                tasks_count = len(task_dict)
+            
+            if tasks_count == 0:
+                await self.clean() # Eksekusi penghapusan pesan status secara total
+            else:
+                await update_status_message(self.message.chat.id)
             
             target_path = os.path.join(self.dir, self.name)
             
@@ -430,7 +435,7 @@ class TaskListener(TaskConfig):
             else:
                 await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
             
-            # --- Tidak ada return disini, biarkan kodenya jalan terus ke bawah untuk auto delete! ---
+            # --- Tidak ada return, skrip turun ke bawah agar file terhapus secara otomatis ---
         # ==========================================
         elif is_gdrive_id(self.up_dest) or getattr(self, 'up_dest', '') == "gd":
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
