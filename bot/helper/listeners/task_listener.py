@@ -302,45 +302,136 @@ class TaskListener(TaskConfig):
             )
             del tg
         # ==========================================
-        # SUNTIKAN MESIN CUSTOM UPLOAD (GOFILE / BUZZHEAVIER)
+        # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR
         # ==========================================
-        elif self.up_dest in ["gofile", "buzzheavier"]:
+        elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier"]:
             LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
             import requests
             import os
-            from asyncio import to_thread
+            import time
+            import asyncio
+            import urllib.parse
             
-            def custom_upload(file_path, dest):
-                try:
-                    if dest == "gofile":
-                        server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
-                        url = f"https://{server}.gofile.io/contents/uploadfile"
-                        with open(file_path, 'rb') as f:
-                            res = requests.post(url, files={'file': f}).json()
-                        return res['data']['downloadPage'] if res.get('status') == 'ok' else "Error Server Gofile"
-                    elif dest == "buzzheavier":
-                        import urllib.parse
-                        fname = urllib.parse.quote(os.path.basename(file_path), safe="")
-                        with open(file_path, "rb") as f:
-                            r = requests.put(f"https://w.buzzheavier.com/{fname}", data=f)
-                        res = r.json()
-                        url_res = res.get("data", {}).get("url")
-                        if not url_res and res.get("data", {}).get("id"):
-                            url_res = f"https://buzzheavier.com/{res['data']['id']}"
-                        return url_res if url_res else "Error Server Buzzheavier"
-                except Exception as e:
-                    return str(e)
-                    
-            if os.path.isfile(up_path):
-                await send_message(self.message, f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n📁 `{self.name}`\nMohon tunggu.")
-                link = await to_thread(custom_upload, up_path, self.up_dest)
-                if link.startswith("http"):
-                    pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {link}"
+            target_path = os.path.join(self.dir, self.name)
+            
+            if os.path.isfile(target_path):
+                ui_msg = await send_message(self.message, f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n📁 `{self.name}`\nMenyiapkan koneksi...")
+                
+                # Variabel berbagi (Shared State) antara Thread HTTP dan Async Task
+                shared_prog = {"uploaded": 0, "total": os.path.getsize(target_path), "done": False, "link": None, "error": None}
+                
+                def sync_upload():
+                    try:
+                        filename = os.path.basename(target_path)
+                        
+                        if self.up_dest == "gofile":
+                            server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
+                            url = f"https://{server}.gofile.io/contents/uploadfile"
+                            boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+                            
+                            # Generator pemecah file (Chunker) + Perekam Progress
+                            def file_gen():
+                                head = (f"--{boundary}\r\n"
+                                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                                        f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
+                                yield head
+                                shared_prog['uploaded'] += len(head)
+                                
+                                with open(target_path, 'rb') as f:
+                                    while chunk := f.read(262144): # Potong per 256KB
+                                        yield chunk
+                                        shared_prog['uploaded'] += len(chunk)
+                                        
+                                tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
+                                yield tail
+                                shared_prog['uploaded'] += len(tail)
+                                
+                            headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
+                            res = requests.post(url, data=file_gen(), headers=headers).json()
+                            
+                            if res.get('status') == 'ok':
+                                shared_prog['link'] = res['data']['downloadPage']
+                            else:
+                                shared_prog['error'] = f"Error Server GoFile: {str(res)}"
+                        
+                        elif self.up_dest == "buzzheavier":
+                            fname = urllib.parse.quote(filename, safe="")
+                            url = f"https://w.buzzheavier.com/{fname}"
+                            
+                            def file_gen_bh():
+                                with open(target_path, 'rb') as f:
+                                    while chunk := f.read(262144):
+                                        yield chunk
+                                        shared_prog['uploaded'] += len(chunk)
+                                        
+                            r = requests.put(url, data=file_gen_bh())
+                            res = r.json()
+                            url_res = res.get("data", {}).get("url")
+                            if not url_res and res.get("data", {}).get("id"):
+                                url_res = f"https://buzzheavier.com/{res['data']['id']}"
+                                
+                            if url_res:
+                                shared_prog['link'] = url_res
+                            else:
+                                shared_prog['error'] = f"Error Server Buzzheavier: {str(res)}"
+                                
+                    except Exception as e:
+                        shared_prog['error'] = str(e)
+                    finally:
+                        shared_prog['done'] = True
+
+                # Tugas Latar Belakang untuk Update Pesan di Telegram
+                async def progress_updater():
+                    last_text = ""
+                    start_time = time.time()
+                    while not shared_prog['done']:
+                        await asyncio.sleep(3) # Update setiap 3 detik
+                        if shared_prog['done']: break
+                        
+                        uploaded = shared_prog['uploaded']
+                        total = shared_prog['total']
+                        percent = (uploaded / total) * 100 if total > 0 else 0
+                        elapsed = time.time() - start_time
+                        speed = uploaded / elapsed if elapsed > 0 else 0
+                        
+                        # Bikin visual kotak loading [██████▒▒▒]
+                        bar_length = 15
+                        filled = int(bar_length * percent / 100)
+                        bar = "█" * filled + "▒" * (bar_length - filled)
+                        
+                        text = (f"⬆️ **Mengupload ke {self.up_dest.upper()}**\n"
+                                f"📁 `{self.name}`\n"
+                                f"[{bar}] {percent:.1f}%\n"
+                                f"**Processed:** {get_readable_file_size(uploaded)} / {get_readable_file_size(total)}\n"
+                                f"**Speed:** {get_readable_file_size(speed)}/s")
+                                
+                        if text != last_text:
+                            try:
+                                await ui_msg.edit_text(text)
+                                last_text = text
+                            except Exception:
+                                pass # Abaikan error kalau kena flood limit
+
+                # Jalankan Upload dan Progress secara bersamaan
+                updater_task = asyncio.create_task(progress_updater())
+                await asyncio.to_thread(sync_upload)
+                await updater_task
+                
+                # Kirim Hasil Akhir
+                if shared_prog['link']:
+                    pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {shared_prog['link']}"
                 else:
-                    pesan = f"❌ **Gagal Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\nError: {link}"
-                await send_message(self.message, pesan)
+                    pesan = f"❌ **Gagal Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\nError: {shared_prog['error']}"
+                    
+                try:
+                    await ui_msg.edit_text(pesan)
+                except:
+                    await send_message(self.message, pesan)
             else:
                 await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
+                
+            self.clean()
+            return
         # ==========================================
         elif is_gdrive_id(self.up_dest) or self.up_dest == "gd":
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
