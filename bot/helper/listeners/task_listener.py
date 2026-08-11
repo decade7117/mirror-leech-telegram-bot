@@ -301,6 +301,49 @@ class TaskListener(TaskConfig):
                 tg.upload(),
             )
             del tg
+        # ==========================================
+        # SUNTIKAN MESIN CUSTOM UPLOAD (GOFILE / BUZZHEAVIER)
+        # ==========================================
+        elif self.up_dest in ["gofile", "buzzheavier"]:
+            LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
+            import requests
+            import os
+            from asyncio import to_thread
+            
+            def custom_upload(file_path, dest):
+                try:
+                    if dest == "gofile":
+                        server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
+                        url = f"https://{server}.gofile.io/contents/uploadfile"
+                        with open(file_path, 'rb') as f:
+                            res = requests.post(url, files={'file': f}).json()
+                        return res['data']['downloadPage'] if res.get('status') == 'ok' else "Error Server Gofile"
+                    elif dest == "buzzheavier":
+                        import urllib.parse
+                        fname = urllib.parse.quote(os.path.basename(file_path), safe="")
+                        with open(file_path, "rb") as f:
+                            r = requests.put(f"https://w.buzzheavier.com/{fname}", data=f)
+                        res = r.json()
+                        url_res = res.get("data", {}).get("url")
+                        if not url_res and res.get("data", {}).get("id"):
+                            url_res = f"https://buzzheavier.com/{res['data']['id']}"
+                        return url_res if url_res else "Error Server Buzzheavier"
+                except Exception as e:
+                    return str(e)
+                    
+            if os.path.isfile(up_path):
+                # Beri tahu user bahwa proses upload custom dimulai
+                await send_message(self.message, f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n📁 `{self.name}`\nMohon tunggu.")
+                
+                link = await to_thread(custom_upload, up_path, self.up_dest)
+                if link.startswith("http"):
+                    pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {link}"
+                else:
+                    pesan = f"❌ **Gagal Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\nError: {link}"
+                await send_message(self.message, pesan)
+            else:
+                await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
+        # ==========================================
         elif is_gdrive_id(self.up_dest):
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
             drive = GoogleDriveUpload(self, up_path)
@@ -321,7 +364,30 @@ class TaskListener(TaskConfig):
                 RCTransfer.upload(up_path),
             )
             del RCTransfer
-        return
+            
+        if self.seed:
+            await clean_target(self.up_dir)
+            async with queue_dict_lock:
+                if self.mid in non_queued_up:
+                    non_queued_up.remove(self.mid)
+            await start_from_queued()
+            return
+            
+        await clean_download(self.dir)
+        async with task_dict_lock:
+            if self.mid in task_dict:
+                del task_dict[self.mid]
+            count = len(task_dict)
+        if count == 0:
+            await self.clean()
+        else:
+            await update_status_message(self.message.chat.id)
+
+        async with queue_dict_lock:
+            if self.mid in non_queued_up:
+                non_queued_up.remove(self.mid)
+
+        await start_from_queued()
 
     async def on_upload_complete(
         self, link, files, folders, mime_type, rclone_path="", dir_id=""
@@ -392,28 +458,6 @@ class TaskListener(TaskConfig):
                 button = None
             msg += f"\n\n<b>cc: </b>{self.tag}"
             await send_message(self.message, msg, button)
-        if self.seed:
-            await clean_target(self.up_dir)
-            async with queue_dict_lock:
-                if self.mid in non_queued_up:
-                    non_queued_up.remove(self.mid)
-            await start_from_queued()
-            return
-        await clean_download(self.dir)
-        async with task_dict_lock:
-            if self.mid in task_dict:
-                del task_dict[self.mid]
-            count = len(task_dict)
-        if count == 0:
-            await self.clean()
-        else:
-            await update_status_message(self.message.chat.id)
-
-        async with queue_dict_lock:
-            if self.mid in non_queued_up:
-                non_queued_up.remove(self.mid)
-
-        await start_from_queued()
 
     async def on_download_error(self, error, button=None):
         async with task_dict_lock:
