@@ -1,3 +1,6 @@
+import asyncio
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.handlers import CallbackQueryHandler
 from aiofiles.os import path as aiopath
 from base64 import b64encode
 from re import match as re_match
@@ -8,6 +11,7 @@ from ..helper.ext_utils.bot_utils import (
     sync_to_async,
     arg_parser,
     COMMAND_USAGE,
+    new_task,
 )
 from ..helper.ext_utils.exceptions import DirectDownloadLinkException
 from ..helper.ext_utils.links_utils import (
@@ -39,7 +43,10 @@ from ..helper.mirror_leech_utils.download_utils.telegram_download import (
     TelegramDownloadHelper,
 )
 from ..helper.telegram_helper.message_utils import send_message, get_tg_link_message
+from ..core.telegram_manager import TgClient
 
+# BUKU TAMU UNTUK MENYIMPAN TASK YANG SEDANG PAUSE
+PENDING_UI_TASKS = {}
 
 class Mirror(TaskListener):
     def __init__(
@@ -135,7 +142,7 @@ class Mirror(TaskListener):
         self.thumbnail_layout = args["-tl"]
         self.as_doc = args["-doc"]
         self.as_med = args["-med"]
-        self.folder_name = f"/{args["-m"]}".rstrip("/") if len(args["-m"]) > 0 else ""
+        self.folder_name = f"/{args['-m']}".rstrip("/") if len(args["-m"]) > 0 else ""
         self.bot_trans = args["-bt"]
         self.user_trans = args["-ut"]
         self.ffmpeg_cmds = args["-ff"]
@@ -334,6 +341,36 @@ class Mirror(TaskListener):
                     await self.remove_from_same_dir()
                     return
 
+        # ==========================================
+        # SUNTIKAN UI TOMBOL (PIKABOT STYLE)
+        # ==========================================
+        if not self.up_dest and not self.is_leech: 
+            buttons = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Drive / Rclone", callback_data=f"updest_{self.message.id}_default"),
+                ],
+                [
+                    InlineKeyboardButton("GoFile", callback_data=f"updest_{self.message.id}_gofile"),
+                    InlineKeyboardButton("Buzzheavier", callback_data=f"updest_{self.message.id}_buzzheavier")
+                ]
+            ])
+
+            ui_msg = await send_message(self.message, "⏳ **Pilih Tujuan Upload:**\n(Waktu tunggu: 60 detik sebelum default)", buttons)
+            self.ui_event = asyncio.Event()
+            
+            PENDING_UI_TASKS[self.message.id] = self 
+
+            try:
+                # Skrip JEDA di sini maksimal 60 detik agar tidak nge-hang jika tidak diklik
+                await asyncio.wait_for(self.ui_event.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                self.up_dest = "" # Kembali ke default (Drive) jika timeout
+            finally:
+                if self.message.id in PENDING_UI_TASKS:
+                    del PENDING_UI_TASKS[self.message.id]
+                await ui_msg.delete()
+        # ==========================================
+
         if file_ is not None:
             await TelegramDownloadHelper(self).add_download(
                 reply_to, f"{path}/", session
@@ -364,34 +401,54 @@ class Mirror(TaskListener):
 async def mirror(client, message):
     bot_loop.create_task(Mirror(client, message).new_event())
 
-
 async def qb_mirror(client, message):
     bot_loop.create_task(Mirror(client, message, is_qbit=True).new_event())
-
 
 async def jd_mirror(client, message):
     bot_loop.create_task(Mirror(client, message, is_jd=True).new_event())
 
-
 async def nzb_mirror(client, message):
     bot_loop.create_task(Mirror(client, message, is_nzb=True).new_event())
 
-
 async def leech(client, message):
     bot_loop.create_task(Mirror(client, message, is_leech=True).new_event())
-
 
 async def qb_leech(client, message):
     bot_loop.create_task(
         Mirror(client, message, is_qbit=True, is_leech=True).new_event()
     )
 
-
 async def jd_leech(client, message):
     bot_loop.create_task(Mirror(client, message, is_leech=True, is_jd=True).new_event())
-
 
 async def nzb_leech(client, message):
     bot_loop.create_task(
         Mirror(client, message, is_leech=True, is_nzb=True).new_event()
     )
+
+# ==========================================
+# RESEPSIONIS PENANGKAP KLIK TOMBOL
+# ==========================================
+@new_task
+async def ui_callback_handler(client, query):
+    data = query.data.split("_")
+    # Format: updest_{message_id}_{destination}
+    if data[0] == "updest":
+        msg_id = int(data[1])
+        dest = data[2]
+        
+        if msg_id in PENDING_UI_TASKS:
+            task = PENDING_UI_TASKS[msg_id]
+            
+            if dest == "default":
+                task.up_dest = "" 
+            else:
+                task.up_dest = dest
+                
+            await query.answer(f"Tujuan diatur ke: {dest.upper()}")
+            task.ui_event.set() 
+        else:
+            await query.answer("Waktu pilih sudah habis / Task tidak valid.", show_alert=True)
+
+# Daftarkan handler
+TgClient.bot.add_handler(CallbackQueryHandler(ui_callback_handler, filters=lambda _, q: q.data.startswith("updest_")))
