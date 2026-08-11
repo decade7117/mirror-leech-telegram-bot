@@ -332,9 +332,7 @@ class TaskListener(TaskConfig):
                     return str(e)
                     
             if os.path.isfile(up_path):
-                # Beri tahu user bahwa proses upload custom dimulai
                 await send_message(self.message, f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n📁 `{self.name}`\nMohon tunggu.")
-                
                 link = await to_thread(custom_upload, up_path, self.up_dest)
                 if link.startswith("http"):
                     pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {link}"
@@ -344,7 +342,7 @@ class TaskListener(TaskConfig):
             else:
                 await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
         # ==========================================
-        elif is_gdrive_id(self.up_dest):
+        elif is_gdrive_id(self.up_dest) or self.up_dest == "gd":
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
             drive = GoogleDriveUpload(self, up_path)
             async with task_dict_lock:
@@ -364,7 +362,7 @@ class TaskListener(TaskConfig):
                 RCTransfer.upload(up_path),
             )
             del RCTransfer
-            
+
         if self.seed:
             await clean_target(self.up_dir)
             async with queue_dict_lock:
