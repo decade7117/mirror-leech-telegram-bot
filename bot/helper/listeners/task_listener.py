@@ -302,7 +302,7 @@ class TaskListener(TaskConfig):
             )
             del tg
         # ==========================================
-        # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR
+        # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & AUTO-DELETE FIX
         # ==========================================
         elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier"]:
             LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
@@ -312,12 +312,17 @@ class TaskListener(TaskConfig):
             import asyncio
             import urllib.parse
             
+            # ---> Hapus pesan 100% download agar tidak nyangkut saat upload <---
+            async with task_dict_lock:
+                if self.mid in task_dict:
+                    del task_dict[self.mid]
+            await update_status_message(self.message.chat.id)
+            
             target_path = os.path.join(self.dir, self.name)
             
             if os.path.isfile(target_path):
                 ui_msg = await send_message(self.message, f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n📁 `{self.name}`\nMenyiapkan koneksi...")
                 
-                # Variabel berbagi (Shared State) antara Thread HTTP dan Async Task
                 shared_prog = {"uploaded": 0, "total": os.path.getsize(target_path), "done": False, "link": None, "error": None}
                 
                 def sync_upload():
@@ -329,7 +334,6 @@ class TaskListener(TaskConfig):
                             url = f"https://{server}.gofile.io/contents/uploadfile"
                             boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
                             
-                            # Generator pemecah file (Chunker) + Perekam Progress
                             def file_gen():
                                 head = (f"--{boundary}\r\n"
                                         f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
@@ -338,7 +342,7 @@ class TaskListener(TaskConfig):
                                 shared_prog['uploaded'] += len(head)
                                 
                                 with open(target_path, 'rb') as f:
-                                    while chunk := f.read(262144): # Potong per 256KB
+                                    while chunk := f.read(262144):
                                         yield chunk
                                         shared_prog['uploaded'] += len(chunk)
                                         
@@ -380,12 +384,11 @@ class TaskListener(TaskConfig):
                     finally:
                         shared_prog['done'] = True
 
-                # Tugas Latar Belakang untuk Update Pesan di Telegram
                 async def progress_updater():
                     last_text = ""
                     start_time = time.time()
                     while not shared_prog['done']:
-                        await asyncio.sleep(3) # Update setiap 3 detik
+                        await asyncio.sleep(3)
                         if shared_prog['done']: break
                         
                         uploaded = shared_prog['uploaded']
@@ -394,7 +397,6 @@ class TaskListener(TaskConfig):
                         elapsed = time.time() - start_time
                         speed = uploaded / elapsed if elapsed > 0 else 0
                         
-                        # Bikin visual kotak loading [██████▒▒▒]
                         bar_length = 15
                         filled = int(bar_length * percent / 100)
                         bar = "█" * filled + "▒" * (bar_length - filled)
@@ -410,14 +412,12 @@ class TaskListener(TaskConfig):
                                 await ui_msg.edit_text(text)
                                 last_text = text
                             except Exception:
-                                pass # Abaikan error kalau kena flood limit
+                                pass
 
-                # Jalankan Upload dan Progress secara bersamaan
                 updater_task = asyncio.create_task(progress_updater())
                 await asyncio.to_thread(sync_upload)
                 await updater_task
                 
-                # Kirim Hasil Akhir
                 if shared_prog['link']:
                     pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {shared_prog['link']}"
                 else:
@@ -429,11 +429,10 @@ class TaskListener(TaskConfig):
                     await send_message(self.message, pesan)
             else:
                 await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
-                
-            self.clean()
-            return
+            
+            # --- Tidak ada return disini, biarkan kodenya jalan terus ke bawah untuk auto delete! ---
         # ==========================================
-        elif is_gdrive_id(self.up_dest) or self.up_dest == "gd":
+        elif is_gdrive_id(self.up_dest) or getattr(self, 'up_dest', '') == "gd":
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
             drive = GoogleDriveUpload(self, up_path)
             async with task_dict_lock:
