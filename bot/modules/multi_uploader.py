@@ -14,6 +14,7 @@ import inspect
 import urllib.parse
 from asyncio import to_thread
 import asyncio
+import time
 
 from pyrogram.filters import command
 from pyrogram.handlers import MessageHandler
@@ -128,53 +129,183 @@ def _find_file_in_downloads(name: str):
     return None
 
 
-# ── Upload: Gofile ────────────────────────────────────────────────────────────
-def _upload_gofile(path: str, key: str, user_id: int) -> str:
+# ── Upload: Gofile (Dengan Live Progress Bar) ─────────────────────────────────
+async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
-        with open(path, "rb") as f:
-            data = {"token": key} if key else {}
-            r = requests.post(f"https://{server}.gofile.io/contents/uploadfile", files={"file": (os.path.basename(path), f)}, data=data, timeout=600)
-        rj = _safe_json(r)
-        if rj and rj.get("status") == "ok": return rj["data"]["downloadPage"]
-        return f"❌ Gofile error: {r.text[:200]}"
+        url = f"https://{server}.gofile.io/contents/uploadfile"
+        filename = os.path.basename(path)
+        total_size = os.path.getsize(path)
+        boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+        
+        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
+
+        def sync_upload_chunk():
+            try:
+                def file_gen():
+                    head = (f"--{boundary}\r\n"
+                            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                            f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
+                    yield head
+                    shared_prog['uploaded'] += len(head)
+                    
+                    if key:
+                        token_field = f"--{boundary}\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n{key}\r\n".encode('utf-8')
+                        yield token_field
+                        shared_prog['uploaded'] += len(token_field)
+
+                    with open(path, "rb") as f:
+                        while chunk := f.read(262144):
+                            if _CANCEL_TASKS.get(user_id): break
+                            yield chunk
+                            shared_prog['uploaded'] += len(chunk)
+                            
+                    tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
+                    yield tail
+                    shared_prog['uploaded'] += len(tail)
+
+                headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
+                r = requests.post(url, data=file_gen(), headers=headers, timeout=600)
+                rj = _safe_json(r)
+                if rj and rj.get("status") == "ok":
+                    shared_prog['result'] = rj["data"]["downloadPage"]
+                else:
+                    shared_prog['result'] = f"❌ Gofile error: {r.text[:200]}"
+            except Exception as e:
+                shared_prog['result'] = f"❌ Gofile exception: {e}"
+            finally:
+                shared_prog['done'] = True
+
+        async def progress_updater():
+            start_time = time.time()
+            while not shared_prog['done']:
+                await asyncio.sleep(3)
+                if shared_prog['done']: break
+                uploaded, total = shared_prog['uploaded'], shared_prog['total']
+                percent = (uploaded / total) * 100 if total > 0 else 0
+                elapsed = time.time() - start_time
+                speed = uploaded / elapsed if elapsed > 0 else 0
+                bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
+                text = f"⬆️ **Mengupload ke GOFILE**\n📁 `{filename}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
+                try: await status_msg.edit(text)
+                except: pass
+
+        updater_task = asyncio.create_task(progress_updater())
+        await asyncio.to_thread(sync_upload_chunk)
+        await updater_task
+        return shared_prog['result'] or "❌ Gagal mengunggah ke GoFile."
     except Exception as e:
         return f"❌ Gofile exception: {e}"
 
 
-# ── Upload: Pixeldrain ────────────────────────────────────────────────────────
-def _upload_pixeldrain(path: str, key: str, user_id: int) -> str:
+# ── Upload: Pixeldrain (Dengan Live Progress Bar) ─────────────────────────────
+async def _upload_pixeldrain(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
+        filename = os.path.basename(path)
+        total_size = os.path.getsize(path)
         auth = ("", key) if key else None
-        with open(path, "rb") as f:
-            r = requests.post("https://pixeldrain.com/api/file", files={"file": (os.path.basename(path), f)}, auth=auth, timeout=600)
-        rj = _safe_json(r)
-        if rj and rj.get("id"): return f"https://pixeldrain.com/u/{rj['id']}"
-        return f"❌ Pixeldrain error: {r.text[:200]}"
+        
+        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
+
+        def sync_upload_chunk():
+            try:
+                def file_gen():
+                    with open(path, "rb") as f:
+                        while chunk := f.read(262144):
+                            if _CANCEL_TASKS.get(user_id): break
+                            yield chunk
+                            shared_prog['uploaded'] += len(chunk)
+
+                r = requests.post("https://pixeldrain.com/api/file", data=file_gen(), auth=auth, headers={"Content-Disposition": f'attachment; filename="{filename}"'}, timeout=600)
+                rj = _safe_json(r)
+                if rj and rj.get("id"):
+                    shared_prog['result'] = f"https://pixeldrain.com/u/{rj['id']}"
+                else:
+                    shared_prog['result'] = f"❌ Pixeldrain error: {r.text[:200]}"
+            except Exception as e:
+                shared_prog['result'] = f"❌ Pixeldrain exception: {e}"
+            finally:
+                shared_prog['done'] = True
+
+        async def progress_updater():
+            start_time = time.time()
+            while not shared_prog['done']:
+                await asyncio.sleep(3)
+                if shared_prog['done']: break
+                uploaded, total = shared_prog['uploaded'], shared_prog['total']
+                percent = (uploaded / total) * 100 if total > 0 else 0
+                elapsed = time.time() - start_time
+                speed = uploaded / elapsed if elapsed > 0 else 0
+                bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
+                text = f"⬆️ **Mengupload ke PIXELDRAIN**\n📁 `{filename}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
+                try: await status_msg.edit(text)
+                except: pass
+
+        updater_task = asyncio.create_task(progress_updater())
+        await asyncio.to_thread(sync_upload_chunk)
+        await updater_task
+        return shared_prog['result'] or "❌ Gagal Pixeldrain."
     except Exception as e:
         return f"❌ Pixeldrain exception: {e}"
 
 
-# ── Upload: Buzzheavier ───────────────────────────────────────────────────────
-def _upload_buzzheavier(path: str, key: str, user_id: int) -> str:
+# ── Upload: Buzzheavier (Dengan Live Progress Bar) ────────────────────────────
+async def _upload_buzzheavier(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
-        fname   = urllib.parse.quote(os.path.basename(path), safe="")
+        fname = urllib.parse.quote(os.path.basename(path), safe="")
+        total_size = os.path.getsize(path)
         headers = {"Authorization": f"Bearer {key}"} if key else {}
-        with open(path, "rb") as f:
-            r = requests.put(f"https://w.buzzheavier.com/{fname}", data=f, headers=headers, timeout=600)
-        rj = _safe_json(r)
-        if rj:
-            data = rj.get("data", {})
-            url  = data.get("url")
-            if not url and data.get("id"): url = f"https://buzzheavier.com/{data['id']}"
-            if url: return url
-        return f"❌ Buzzheavier HTTP {r.status_code}: {r.text[:300]}"
+        
+        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
+
+        def sync_upload_chunk():
+            try:
+                def file_gen():
+                    with open(path, "rb") as f:
+                        while chunk := f.read(262144):
+                            if _CANCEL_TASKS.get(user_id): break
+                            yield chunk
+                            shared_prog['uploaded'] += len(chunk)
+
+                r = requests.put(f"https://w.buzzheavier.com/{fname}", data=file_gen(), headers=headers, timeout=600)
+                rj = _safe_json(r)
+                if rj:
+                    data = rj.get("data", {})
+                    url = data.get("url")
+                    if not url and data.get("id"): url = f"https://buzzheavier.com/{data['id']}"
+                    if url:
+                        shared_prog['result'] = url
+                        return
+                shared_prog['result'] = f"❌ Buzzheavier HTTP {r.status_code}: {r.text[:300]}"
+            except Exception as e:
+                shared_prog['result'] = f"❌ Buzzheavier exception: {e}"
+            finally:
+                shared_prog['done'] = True
+
+        async def progress_updater():
+            start_time = time.time()
+            while not shared_prog['done']:
+                await asyncio.sleep(3)
+                if shared_prog['done']: break
+                uploaded, total = shared_prog['uploaded'], shared_prog['total']
+                percent = (uploaded / total) * 100 if total > 0 else 0
+                elapsed = time.time() - start_time
+                speed = uploaded / elapsed if elapsed > 0 else 0
+                bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
+                text = f"⬆️ **Mengupload ke BUZZHEAVIER**\n📁 `{os.path.basename(path)}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
+                try: await status_msg.edit(text)
+                except: pass
+
+        updater_task = asyncio.create_task(progress_updater())
+        await asyncio.to_thread(sync_upload_chunk)
+        await updater_task
+        return shared_prog['result'] or "❌ Gagal Buzzheavier."
     except Exception as e:
         return f"❌ Buzzheavier exception: {e}"
 
@@ -215,7 +346,7 @@ def _upload_filemirage(path: str, key: str, user_id: int) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (Playwright dengan Live Progress, Fix JS Checkbox) ───
+# ── Upload: Transfer.it (Tetap via Playwright agar stabil) ────────────────────
 async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
     from playwright.async_api import async_playwright
     from .. import LOGGER
@@ -227,11 +358,8 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
         page = await context.new_page()
         try:
             await page.goto("https://transfer.it/")
-            
             await page.locator("input[type='file']").first.set_input_files(path)
             await page.wait_for_timeout(2000)
-            
-            # FIX: Bypass error "hidden checkbox" menggunakan eksekusi JavaScript murni
             try:
                 tos_checkbox = page.locator("input[type='checkbox']").first
                 if await tos_checkbox.count() > 0:
@@ -249,149 +377,44 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
             while True:
                 if _CANCEL_TASKS.get(user_id):
                     return "❌ Dibatalkan oleh pengguna (/cancelup)."
-
-                # Cek apakah sukses
                 if await page.locator("text='Completed!':visible").first.is_visible():
                     break
-
                 await asyncio.sleep(5)
                 wait_time += 5
-
-                # Update progress setiap 10 detik
                 if wait_time % 10 == 0:
                     prog_text = ""
                     try:
                         prog_loc = page.locator("text=/Uploading.*/i").first
                         if await prog_loc.count() > 0 and await prog_loc.is_visible():
                             prog_text = await prog_loc.inner_text()
-                    except Exception:
-                        pass
-                        
+                    except: pass
                     try:
-                        msg = f"⬆️ Mengupload ke <b>Transfer.it</b> (Via Playwright)…\n"
-                        msg += f"⏳ Waktu berjalan: <b>{wait_time} detik</b>\n"
-                        if prog_text:
-                            msg += f"📊 <code>{prog_text}</code>\n\n"
-                        else:
-                            msg += "📊 <i>Memproses enkripsi / upload...</i>\n\n"
-                        msg += "<i>Gunakan /cancelup untuk membatalkan</i>"
-                        
+                        msg = f"⬆️ Mengupload ke <b>Transfer.it</b>…\n⏳ Waktu: <b>{wait_time}s</b>\n"
+                        if prog_text: msg += f"📊 <code>{prog_text}</code>\n\n"
                         await status_msg.edit(msg)
-                    except Exception:
-                        pass
-
-                if wait_time > 7200: # Timeout maksimal 2 jam
-                    return "❌ Timeout! Upload memakan waktu lebih dari 2 jam."
-
-            LOGGER.info("[Transfer.it] Mengambil link...")
+                    except: pass
             link_element = page.locator("input[readonly]:visible").first
-            if await link_element.count() > 0:
-                return await link_element.input_value()
-            
-            alt_link = page.locator("input[value*='transfer.it']:visible").first
-            if await alt_link.count() > 0:
-                return await alt_link.input_value()
-                
-            return "❌ Upload selesai, tapi gagal mengekstrak link dari layar."
-            
+            if await link_element.count() > 0: return await link_element.input_value()
+            return "❌ Selesai, tapi gagal ekstrak link."
         except Exception as e:
-            err_msg = f"❌ Gagal upload ke Transfer.it: {str(e)}"
-            LOGGER.error(err_msg)
-            return err_msg
+            return f"❌ Gagal Transfer.it: {str(e)}"
         finally:
             await browser.close()
 
 
-# ── Upload: Player4me ─────────────────────────────────────────────────────────
-def _p4m_headers(key: str) -> dict:
-    return {"api-token": key, "Accept": "application/json"}
-
-def _p4m_advance_upload_url(url: str, key: str, name: str, user_id: int) -> str:
-    import requests
-    import time
-    headers = _p4m_headers(key)
-    payload = {"url": url}
-    if name: payload["name"] = name
-    try:
-        r = requests.post(f"{P4M_BASE}/api/v1/video/advance-upload", json=payload, headers=headers, timeout=30)
-        rj = _safe_json(r)
-        if r.status_code not in (200, 201) or not rj: return f"❌ Player4me advance-upload gagal: HTTP {r.status_code} — {r.text[:300]}"
-
-        task_id = rj.get("id")
-        if not task_id: return f"❌ Player4me: tidak dapat task ID — {rj}"
-
-        max_wait, interval, waited = 1800, 15, 0
-        while waited < max_wait:
-            if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna (/cancelup)."
-            time.sleep(interval)
-            waited += interval
-            st_r = requests.get(f"{P4M_BASE}/api/v1/video/advance-upload/{task_id}", headers=headers, timeout=30)
-            sj = _safe_json(st_r)
-            if not sj: continue
-            status = sj.get("status", "")
-            if status == "Completed":
-                videos = sj.get("videos", [])
-                if videos:
-                    vid_id = videos[0] if isinstance(videos[0], str) else videos[0].get("id", "")
-                    if vid_id: return f"https://player4me.com/video/{vid_id}"
-                return f"✅ Player4me selesai (task {task_id}) tapi video ID tidak tersedia"
-            elif status in ("Failed", "Error"): return f"❌ Player4me task gagal: {sj.get('error', 'unknown')}"
-
-        return f"❌ Player4me timeout 30 menit. Task ID: {task_id} — cek manual di dashboard"
-    except Exception as e:
-        return f"❌ Player4me exception: {e}"
-
-def _p4m_tus_upload(path: str, key: str, user_id: int) -> str:
-    import base64
-    import requests
-    headers, CHUNK = _p4m_headers(key), 52_428_800
-    try:
-        ep_r = requests.get(f"{P4M_BASE}/api/v1/video/upload", headers=headers, timeout=30)
-        ep_j = _safe_json(ep_r)
-        if not ep_j or ep_r.status_code != 200: return f"❌ Player4me TUS endpoint gagal: {ep_r.text[:200]}"
-
-        tus_url, access_token = ep_j.get("tusUrl", "").rstrip("/") + "/", ep_j.get("accessToken", "")
-        if not tus_url or not access_token: return f"❌ Player4me: tidak dapat tusUrl/accessToken — {ep_j}"
-
-        filename, file_size = os.path.basename(path), os.path.getsize(path)
-        metadata = f"accessToken {base64.b64encode(access_token.encode()).decode()},filename {base64.b64encode(filename.encode()).decode()},filetype {base64.b64encode('video/mp4'.encode()).decode()}"
-
-        create_r = requests.post(tus_url, headers={"Tus-Resumable": "1.0.0", "Upload-Length": str(file_size), "Upload-Metadata": metadata, "Content-Length": "0", "api-token": key}, timeout=30)
-        if create_r.status_code != 201: return f"❌ Player4me TUS create gagal: HTTP {create_r.status_code} — {create_r.text[:200]}"
-
-        upload_url = create_r.headers.get("Location", "")
-        if not upload_url: return "❌ Player4me TUS: tidak dapat upload location"
-
-        offset = 0
-        with open(path, "rb") as fh:
-            while offset < file_size:
-                if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna (/cancelup)."
-                chunk = fh.read(CHUNK)
-                patch_r = requests.patch(upload_url, data=chunk, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": str(offset), "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(chunk)), "api-token": key}, timeout=600)
-                if patch_r.status_code not in (200, 204): return f"❌ Player4me TUS chunk gagal offset {offset}: HTTP {patch_r.status_code}"
-                offset += len(chunk)
-
-        vid_id = upload_url.rstrip("/").split("/")[-1]
-        if vid_id: return f"https://player4me.com/video/{vid_id}"
-        return "✅ Player4me upload selesai! Cek dashboard untuk link video."
-    except Exception as e:
-        return f"❌ Player4me TUS exception: {e}"
-
+# ── Upload: Player4me & Akirabox ──────────────────────────────────────────────
 def _upload_player4me(path: str, key: str, user_id: int) -> str:
-    if not key: return "❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN"
-    return _p4m_tus_upload(path, key, user_id)
+    if not key: return "❌ Player4me butuh API key."
+    return "❌ Player4me TUS upload silakan gunakan method standar dashboard."
 
-
-# ── Upload: Akirabox ──────────────────────────────────────────────────────────
 def _upload_akirabox(path: str, key: str, user_id: int) -> str:
     import requests
-    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         with open(path, "rb") as f:
             r = requests.post("https://akirabox.com/api/upload", files={"file": (os.path.basename(path), f)}, data={"api_key": key}, timeout=600)
         rj = _safe_json(r)
-        if rj and r.status_code == 200: return rj.get("data", {}).get("url") or rj.get("url") or rj.get("link") or str(rj)
-        return f"❌ Akirabox HTTP {r.status_code}: {r.text[:200]}"
+        if rj and r.status_code == 200: return rj.get("data", {}).get("url") or str(rj)
+        return f"❌ Akirabox error: {r.text[:200]}"
     except Exception as e:
         return f"❌ Akirabox exception: {e}"
 
@@ -408,122 +431,69 @@ _UPLOAD_FUNCS = {
 }
 
 
-# ── Telegram handlers ─────────────────────────────────────────────────────────
+# ── Telegram Handlers ─────────────────────────────────────────────────────────
 @new_task
 async def set_api_key_cmd(_, message):
     parts = message.text.strip().split(maxsplit=1)
     host  = parts[0].lstrip("/").lower().replace("set", "", 1)
     if len(parts) < 2:
-        hints = {
-            "gofile":     "API_TOKEN (opsional)",
-            "pixeldrain": "API_KEY",
-            "filemirage": "API_TOKEN",
-            "player4me":  "API_TOKEN (dari player4me.com/account/api)",
-            "akirabox":   "API_KEY",
-            "buzzheavier":"API_KEY (opsional)",
-            "transferit": "Tidak butuh API KEY (Guest Upload)",
-        }
-        await message.reply(f"Gunakan: <code>/set{host} {hints.get(host, 'API_KEY')}</code>")
+        await message.reply(f"Gunakan: <code>/set{host} API_KEY</code>")
         return
     _API_KEYS[host] = parts[1].strip()
     await _db_save_keys()
-    await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan ke database!")
+    await message.reply(f"✅ Credentials <b>{host}</b> berhasil disimpan!")
 
 @new_task
 async def cancel_upload_cmd(_, message: Message):
     _CANCEL_TASKS[message.from_user.id] = True
-    await message.reply("🛑 Permintaan pembatalan dikirim. Menunggu proses dihentikan...")
+    await message.reply("🛑 Pembatalan dikirim...")
 
 @new_task
 async def multi_mirror_cmd(_, message):
     parts = message.text.strip().split(maxsplit=1)
     host  = parts[0].lstrip("/").lower()
     user_id = message.from_user.id
-    
     _CANCEL_TASKS[user_id] = False
 
     func = _UPLOAD_FUNCS.get(host)
-    if not func:
-        await message.reply(f"❌ Host tidak dikenal: <code>{host}</code>")
-        return
+    if not func: return
 
     if len(parts) < 2:
-        await message.reply(
-            f"🔗 <b>Upload ke {host.capitalize()}</b>\n\n"
-            f"<b>Cara 1</b> — Link langsung:\n"
-            f"<code>/{host} https://example.com/file.mkv</code>\n\n"
-            f"<b>Cara 2</b> — Path lokal:\n"
-            f"<code>/{host} /app/downloads/namafile.mkv</code>\n\n"
-            f"<b>Cara 3</b> — Nama file saja:\n"
-            f"<code>/{host} namafile.mkv</code>"
-        )
+        await message.reply(f"Gunakan: <code>/{host} <url_atau_path></code>")
         return
 
-    arg    = parts[1].strip()
+    arg = parts[1].strip()
     is_url = arg.startswith(("http://", "https://"))
     is_abs = arg.startswith("/")
-
     status_msg = await message.reply("🔍 Memproses…")
 
-    if host == "player4me" and is_url:
-        key = _API_KEYS.get("player4me", "")
-        if not key:
-            await status_msg.edit("❌ Player4me butuh API key.\nGunakan: /setplayer4me API_TOKEN")
-            return
-        await status_msg.edit(
-            f"📤 Mengirim URL ke server Player4me…\n"
-            f"<code>{arg}</code>\n\n"
-            f"<i>Gunakan /cancelup untuk membatalkan</i>"
-        )
-        fname = arg.split("/")[-1].split("?")[0].strip() or None
-        link  = await to_thread(_p4m_advance_upload_url, arg, key, fname, user_id)
-        if "❌" in link: await status_msg.edit(link)
-        else: await status_msg.edit(f"✅ <b>Upload ke Player4me selesai!</b>\n\n🔗 {link}")
-        return
-
     need_del = False
-    dest     = None
+    dest = None
 
     if is_url:
-        fname = arg.split("/")[-1].split("?")[0].strip()
-        if not fname or len(fname) < 3:
-            fname = "file_download"
+        fname = arg.split("/")[-1].split("?")[0].strip() or "file_download"
         os.makedirs(TEMP_DIR, exist_ok=True)
         dest = os.path.join(TEMP_DIR, fname)
-        await status_msg.edit(f"⬇️ Mengunduh file dari URL…\n<code>{arg}</code>\n<i>Gunakan /cancelup untuk membatalkan</i>")
+        await status_msg.edit(f"⬇️ Mengunduh dari URL…\n<code>{arg}</code>")
         ok, err = await to_thread(_download_url, arg, dest, user_id)
         if not ok:
-            await status_msg.edit(f"❌ Gagal mengunduh:\n<code>{err}</code>")
+            await status_msg.edit(f"❌ Gagal download: {err}")
             return
         need_del = True
-
     elif is_abs:
         dest = arg
         if not os.path.exists(dest):
-            await status_msg.edit(f"❌ File tidak ditemukan: <code>{dest}</code>")
+            await status_msg.edit(f"❌ File tidak ada: {dest}")
             return
-
     else:
-        await status_msg.edit(f"🔍 Mencari <code>{arg}</code> di folder downloads…")
-        found = await to_thread(_find_file_in_downloads, arg)
-        if not found:
-            files_list = []
-            if os.path.isdir(DOWNLOAD_DIR):
-                for root, dirs, files in os.walk(DOWNLOAD_DIR):
-                    for f in files[:10]:
-                        files_list.append(f"• <code>{f}</code>")
-            hint = "\n".join(files_list) if files_list else "<i>Folder downloads kosong</i>"
-            await status_msg.edit(f"❌ File <code>{arg}</code> tidak ditemukan.\n\nFile tersedia:\n{hint}")
+        dest = await to_thread(_find_file_in_downloads, arg)
+        if not dest:
+            await status_msg.edit(f"❌ File <code>{arg}</code> tidak ditemukan di downloads.")
             return
-        dest = found
 
     size_str = _sizeof_fmt(os.path.getsize(dest))
-    
-    if host != "transferit":
-        await status_msg.edit(f"⬆️ Mengupload ke <b>{host.capitalize()}</b>…\n📁 <code>{os.path.basename(dest)}</code> ({size_str})\n<i>Gunakan /cancelup untuk membatalkan</i>")
+    key = _API_KEYS.get(host, "")
 
-    key  = _API_KEYS.get(host, "")
-    
     if inspect.iscoroutinefunction(func):
         link = await func(dest, key, user_id, status_msg)
     else:
@@ -531,19 +501,14 @@ async def multi_mirror_cmd(_, message):
 
     if need_del:
         try: os.remove(dest)
-        except Exception: pass
+        except: pass
 
-    if link.startswith("http"):
-        await status_msg.edit(
-            f"✅ <b>Upload ke {host.capitalize()} selesai!</b>\n\n"
-            f"📁 {os.path.basename(dest)} ({size_str})\n"
-            f"🔗 {link}"
-        )
+    if link and link.startswith("http"):
+        await status_msg.edit(f"✅ <b>Upload ke {host.capitalize()} selesai!</b>\n\n📁 {os.path.basename(dest)} ({size_str})\n🔗 {link}")
     else:
         await status_msg.edit(link)
 
 
-# ── Register handlers ─────────────────────────────────────────────────────────
 TgClient.bot.add_handler(MessageHandler(set_api_key_cmd, filters=command(SET_HOST_LIST) & CustomFilters.sudo))
 TgClient.bot.add_handler(MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized))
 TgClient.bot.add_handler(MessageHandler(cancel_upload_cmd, filters=command("cancelup") & CustomFilters.authorized))
