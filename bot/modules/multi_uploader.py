@@ -3,7 +3,7 @@
  bot/modules/multi_uploader.py
  FITUR:
  - /gofile, /pixeldrain, /buzzheavier, /filemirage, /player4me, /akirabox
- - /transferit     → download video dari URL dan upload ke transfer.it (Murni via API Token/SID)
+ - /transferit     → download video dari URL dan upload ke transfer.it (Playwright + Inject Token SID)
  - /cancelup       → Membatalkan proses download/upload yang sedang berjalan
 ============================================================
 """
@@ -129,7 +129,7 @@ def _find_file_in_downloads(name: str):
     return None
 
 
-# ── Upload: Gofile ────────────────────────────────────────────────────────────
+# ── Upload: Gofile (Aman, Fix JSON) ───────────────────────────────────────────
 async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
@@ -137,50 +137,30 @@ async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message)
         server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
         url = f"https://{server}.gofile.io/contents/uploadfile"
         filename = os.path.basename(path)
-        total_size = os.path.getsize(path)
-        boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
         
-        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
+        shared_prog = {"uploaded": 0, "total": os.path.getsize(path), "done": False, "result": None}
 
         def sync_upload_chunk():
             try:
-                head = (f"--{boundary}\r\n"
-                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-                        f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
-                tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
-                
-                token_field = b""
-                if key:
-                    token_field = (f"--{boundary}\r\n"
-                                   f'Content-Disposition: form-data; name="token"\r\n\r\n'
-                                   f'{key}\r\n').encode('utf-8')
-                                   
-                total_length = len(head) + len(token_field) + total_size + len(tail)
-                
-                def file_gen():
-                    yield head
-                    shared_prog['uploaded'] += len(head)
-                    if key:
-                        yield token_field
-                        shared_prog['uploaded'] += len(token_field)
-                    with open(path, "rb") as f:
-                        while chunk := f.read(262144):
-                            if _CANCEL_TASKS.get(user_id): break
-                            yield chunk
-                            shared_prog['uploaded'] += len(chunk)
-                    yield tail
-                    shared_prog['uploaded'] += len(tail)
+                class ProgressTracker:
+                    def __init__(self, filepath):
+                        self.f = open(filepath, 'rb')
+                    def read(self, size=-1):
+                        chunk = self.f.read(size)
+                        shared_prog['uploaded'] += len(chunk)
+                        return chunk
+                    def seek(self, offset, whence=0): return self.f.seek(offset, whence)
+                    def tell(self): return self.f.tell()
+                    def close(self): self.f.close()
 
-                headers = {
-                    'Content-Type': f'multipart/form-data; boundary={boundary}',
-                    'Content-Length': str(total_length)
-                }
-                r = requests.post(url, data=file_gen(), headers=headers, timeout=600)
+                tr = ProgressTracker(path)
+                data = {'token': key} if key else {}
+                r = requests.post(url, files={'file': (filename, tr)}, data=data, timeout=600)
+                tr.close()
+                
                 rj = _safe_json(r)
-                if rj and rj.get("status") == "ok":
-                    shared_prog['result'] = rj["data"]["downloadPage"]
-                else:
-                    shared_prog['result'] = f"❌ Gofile error: {r.text[:200]}"
+                if rj and rj.get("status") == "ok": shared_prog['result'] = rj["data"]["downloadPage"]
+                else: shared_prog['result'] = f"❌ Gofile error: {r.text[:200]}"
             except Exception as e:
                 shared_prog['result'] = f"❌ Gofile exception: {e}"
             finally:
@@ -214,30 +194,30 @@ async def _upload_pixeldrain(path: str, key: str, user_id: int, status_msg: Mess
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     try:
         filename = os.path.basename(path)
-        total_size = os.path.getsize(path)
         auth = ("", key) if key else None
         
-        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
+        shared_prog = {"uploaded": 0, "total": os.path.getsize(path), "done": False, "result": None}
 
         def sync_upload_chunk():
             try:
-                def file_gen():
-                    with open(path, "rb") as f:
-                        while chunk := f.read(262144):
-                            if _CANCEL_TASKS.get(user_id): break
-                            yield chunk
-                            shared_prog['uploaded'] += len(chunk)
+                class ProgressTracker:
+                    def __init__(self, filepath):
+                        self.f = open(filepath, 'rb')
+                    def read(self, size=-1):
+                        chunk = self.f.read(size)
+                        shared_prog['uploaded'] += len(chunk)
+                        return chunk
+                    def seek(self, offset, whence=0): return self.f.seek(offset, whence)
+                    def tell(self): return self.f.tell()
+                    def close(self): self.f.close()
 
-                headers = {
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Content-Length": str(total_size)
-                }
-                r = requests.post("https://pixeldrain.com/api/file", data=file_gen(), auth=auth, headers=headers, timeout=600)
+                tr = ProgressTracker(path)
+                r = requests.post("https://pixeldrain.com/api/file", files={'file': (filename, tr)}, auth=auth, timeout=600)
+                tr.close()
+                
                 rj = _safe_json(r)
-                if rj and rj.get("id"):
-                    shared_prog['result'] = f"https://pixeldrain.com/u/{rj['id']}"
-                else:
-                    shared_prog['result'] = f"❌ Pixeldrain error: {r.text[:200]}"
+                if rj and rj.get("id"): shared_prog['result'] = f"https://pixeldrain.com/u/{rj['id']}"
+                else: shared_prog['result'] = f"❌ Pixeldrain error: {r.text[:200]}"
             except Exception as e:
                 shared_prog['result'] = f"❌ Pixeldrain exception: {e}"
             finally:
@@ -265,7 +245,7 @@ async def _upload_pixeldrain(path: str, key: str, user_id: int, status_msg: Mess
         return f"❌ Pixeldrain exception: {e}"
 
 
-# ── Upload: Buzzheavier ───────────────────────────────────────────────────────
+# ── Upload: Buzzheavier (Fix Error 411 Length Required) ───────────────────────
 async def _upload_buzzheavier(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
@@ -280,14 +260,21 @@ async def _upload_buzzheavier(path: str, key: str, user_id: int, status_msg: Mes
                 headers = {"Content-Length": str(total_size)}
                 if key: headers["Authorization"] = f"Bearer {key}"
                 
-                def file_gen():
-                    with open(path, "rb") as f:
-                        while chunk := f.read(262144):
-                            if _CANCEL_TASKS.get(user_id): break
-                            yield chunk
-                            shared_prog['uploaded'] += len(chunk)
+                class ProgressTracker:
+                    def __init__(self, filepath):
+                        self.f = open(filepath, 'rb')
+                    def read(self, size=-1):
+                        chunk = self.f.read(size)
+                        shared_prog['uploaded'] += len(chunk)
+                        return chunk
+                    def seek(self, offset, whence=0): return self.f.seek(offset, whence)
+                    def tell(self): return self.f.tell()
+                    def close(self): self.f.close()
 
-                r = requests.put(f"https://w.buzzheavier.com/{fname}", data=file_gen(), headers=headers, timeout=600)
+                tr = ProgressTracker(path)
+                r = requests.put(f"https://w.buzzheavier.com/{fname}", data=tr, headers=headers, timeout=600)
+                tr.close()
+                
                 rj = _safe_json(r)
                 if rj:
                     data = rj.get("data", {})
@@ -360,82 +347,73 @@ def _upload_filemirage(path: str, key: str, user_id: int) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (Murni API Token Tanpa Playwright) ────────────────────
+# ── Upload: Transfer.it (Inject SID + Playwright Automation) ──────────────────
 async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
-    import requests
-    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
+    from playwright.async_api import async_playwright
+    from .. import LOGGER
+
+    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan."
     
-    token = key
-    if not token or ":" in token:
-        return "❌ Transfer.it sekarang **WAJIB** menggunakan Token/SID.\n\nCara: Buka Transfer.it -> Login -> Tekan F12 (Inspect Element) -> Application -> Local Storage -> Copy isi `token` atau `sid`.\n\nGunakan: `/settransferit <TOKEN_ANDA>`"
-
-    try:
-        filename = os.path.basename(path)
-        total_size = os.path.getsize(path)
-        boundary = '----WebKitFormBoundaryTransferItAPI'
+    LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
+    await status_msg.edit("🚀 **Transfer.it:** Menjalankan mesin Playwright (Bypass Login)...")
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
         
-        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
-
-        def sync_upload_chunk():
+        # SUNTIKAN SID AGAR BYPASS HALAMAN LOGIN
+        if key and ":" not in key:
+            await context.add_cookies([{
+                'name': 'sid', 'value': key, 'domain': '.transfer.it', 'path': '/'
+            }])
+            
+        page = await context.new_page()
+        try:
+            await page.goto("https://transfer.it/")
+            await page.locator("input[type='file']").first.set_input_files(path)
+            await page.wait_for_timeout(2000)
+            
             try:
-                head = (f"--{boundary}\r\n"
-                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-                        f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
-                tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
-                
-                total_length = len(head) + total_size + len(tail)
-                
-                def file_gen():
-                    yield head
-                    shared_prog['uploaded'] += len(head)
-                    with open(path, "rb") as f:
-                        while chunk := f.read(262144):
-                            if _CANCEL_TASKS.get(user_id): break
-                            yield chunk
-                            shared_prog['uploaded'] += len(chunk)
-                    yield tail
-                    shared_prog['uploaded'] += len(tail)
-
-                headers = {
-                    'Content-Type': f'multipart/form-data; boundary={boundary}',
-                    'Content-Length': str(total_length),
-                    'Authorization': f'Bearer {token}',
-                    'Cookie': f'sid={token}'
-                }
-                
-                r = requests.post("https://transfer.it/api/upload", data=file_gen(), headers=headers, timeout=600)
-                rj = _safe_json(r)
-                
-                if r.status_code in [200, 201] and rj:
-                    link = rj.get('url') or rj.get('link') or rj.get('data', {}).get('url')
-                    shared_prog['result'] = link if link else f"Sukses, tapi URL tidak ditemukan: {rj}"
-                else:
-                    shared_prog['result'] = f"❌ Transfer.it API Error {r.status_code}: {r.text[:200]}"
+                tos_checkbox = page.locator("input[type='checkbox']").first
+                if await tos_checkbox.count() > 0:
+                    await tos_checkbox.evaluate("node => node.checked = true")
+                    await tos_checkbox.evaluate("node => node.dispatchEvent(new Event('change'))")
+                    await page.wait_for_timeout(500)
             except Exception as e:
-                shared_prog['result'] = f"❌ Transfer.it Exception: {e}"
-            finally:
-                shared_prog['done'] = True
-
-        async def progress_updater():
-            start_time = time.time()
-            while not shared_prog['done']:
-                await asyncio.sleep(3)
-                if shared_prog['done']: break
-                uploaded, total = shared_prog['uploaded'], shared_prog['total']
-                percent = (uploaded / total) * 100 if total > 0 else 0
-                elapsed = time.time() - start_time
-                speed = uploaded / elapsed if elapsed > 0 else 0
-                bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
-                text = f"⬆️ **Mengupload ke TRANSFER.IT**\n📁 `{filename}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
-                try: await status_msg.edit(text)
-                except: pass
-
-        updater_task = asyncio.create_task(progress_updater())
-        await asyncio.to_thread(sync_upload_chunk)
-        await updater_task
-        return shared_prog['result'] or "❌ Gagal mengunggah ke Transfer.it."
-    except Exception as e:
-        return f"❌ Transfer.it exception: {e}"
+                LOGGER.info(f"[Transfer.it] Mengabaikan TOS checkbox: {e}")
+            
+            transfer_btn = page.locator("button:has-text('Transfer'):visible").first
+            await transfer_btn.wait_for(state="visible", timeout=15000)
+            await transfer_btn.click()
+            
+            wait_time = 0
+            while True:
+                if _CANCEL_TASKS.get(user_id):
+                    return "❌ Dibatalkan oleh pengguna (/cancelup)."
+                if await page.locator("text='Completed!':visible").first.is_visible():
+                    break
+                await asyncio.sleep(5)
+                wait_time += 5
+                if wait_time % 10 == 0:
+                    prog_text = ""
+                    try:
+                        prog_loc = page.locator("text=/Uploading.*/i").first
+                        if await prog_loc.count() > 0 and await prog_loc.is_visible():
+                            prog_text = await prog_loc.inner_text()
+                    except: pass
+                    try:
+                        msg = f"⬆️ Mengupload ke **Transfer.it**…\n⏳ Waktu: **{wait_time}s**\n"
+                        if prog_text: msg += f"📊 <code>{prog_text}</code>\n\n"
+                        await status_msg.edit(msg)
+                    except: pass
+                    
+            link_element = page.locator("input[readonly]:visible").first
+            if await link_element.count() > 0: return await link_element.input_value()
+            return "❌ Selesai, tapi gagal ekstrak link."
+        except Exception as e:
+            return f"❌ Gagal Transfer.it: {str(e)}"
+        finally:
+            await browser.close()
 
 
 # ── Upload: Player4me & Akirabox ──────────────────────────────────────────────
