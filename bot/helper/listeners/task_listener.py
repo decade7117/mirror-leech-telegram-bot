@@ -304,7 +304,7 @@ class TaskListener(TaskConfig):
 
         # ==========================================
         # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & ANTI-HANTU
-        # (GOFILE, BUZZHEAVIER, PIXELDRAIN, FILEMIRAGE, PLAYER4ME)
+        # (FIX CONTENT-LENGTH AVOIDING ERROR 411 & JSON EXPECTING VALUE)
         # ==========================================
         elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier", "pixeldrain", "filemirage", "player4me"]:
             LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
@@ -316,7 +316,6 @@ class TaskListener(TaskConfig):
             import math
             import base64
             
-            # Coba ambil API Keys dari multi_uploader jika ada, supaya otomatis terbaca
             try:
                 from bot.modules.multi_uploader import _API_KEYS
             except ImportError:
@@ -347,43 +346,55 @@ class TaskListener(TaskConfig):
                         filename = os.path.basename(target_path)
                         file_size = shared_prog['total']
                         
-                        # 1. GOFILE
+                        # 1. GOFILE (Fix JSON Error)
                         if self.up_dest == "gofile":
                             server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
                             url = f"https://{server}.gofile.io/contents/uploadfile"
                             boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
                             
+                            head = (f"--{boundary}\r\n"
+                                    f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                                    f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
+                            tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
+                            
+                            token_field = b""
+                            if api_key:
+                                token_field = (f"--{boundary}\r\n"
+                                               f'Content-Disposition: form-data; name="token"\r\n\r\n'
+                                               f'{api_key}\r\n').encode('utf-8')
+                                               
+                            # Kalkulasi Content-Length akurat agar server Gofile tidak menolak
+                            total_length = len(head) + len(token_field) + file_size + len(tail)
+                            
                             def file_gen():
-                                head = (f"--{boundary}\r\n"
-                                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-                                        f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
                                 yield head
                                 shared_prog['uploaded'] += len(head)
-                                
                                 if api_key:
-                                    tk = f"--{boundary}\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n{api_key}\r\n".encode('utf-8')
-                                    yield tk
-                                    shared_prog['uploaded'] += len(tk)
-                                    
+                                    yield token_field
+                                    shared_prog['uploaded'] += len(token_field)
                                 with open(target_path, 'rb') as f:
                                     while chunk := f.read(262144):
                                         yield chunk
                                         shared_prog['uploaded'] += len(chunk)
-                                        
-                                tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
                                 yield tail
                                 shared_prog['uploaded'] += len(tail)
                                 
-                            headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
+                            headers = {
+                                'Content-Type': f'multipart/form-data; boundary={boundary}',
+                                'Content-Length': str(total_length) # INI OBAT PENAWARNYA!
+                            }
                             res = requests.post(url, data=file_gen(), headers=headers).json()
                             if res.get('status') == 'ok': shared_prog['link'] = res['data']['downloadPage']
                             else: shared_prog['error'] = f"Gofile API Error: {res}"
                         
-                        # 2. BUZZHEAVIER
+                        # 2. BUZZHEAVIER (Fix Error 411 Length Required)
                         elif self.up_dest == "buzzheavier":
                             fname = urllib.parse.quote(filename, safe="")
                             url = f"https://w.buzzheavier.com/{fname}"
-                            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                            
+                            # Wajib memasukkan Content-Length
+                            headers = {"Content-Length": str(file_size)}
+                            if api_key: headers["Authorization"] = f"Bearer {api_key}"
                             
                             def file_gen_bh():
                                 with open(target_path, 'rb') as f:
@@ -398,22 +409,27 @@ class TaskListener(TaskConfig):
                             if url_res: shared_prog['link'] = url_res
                             else: shared_prog['error'] = f"Buzzheavier Error: {res}"
 
-                        # 3. PIXELDRAIN
+                        # 3. PIXELDRAIN (Fix Chunked Issue)
                         elif self.up_dest == "pixeldrain":
                             auth = ("", api_key) if api_key else None
+                            headers = {
+                                "Content-Disposition": f'attachment; filename="{filename}"',
+                                "Content-Length": str(file_size)
+                            }
                             def file_gen_pd():
                                 with open(target_path, 'rb') as f:
                                     while chunk := f.read(262144):
                                         yield chunk
                                         shared_prog['uploaded'] += len(chunk)
-                            r = requests.post("https://pixeldrain.com/api/file", data=file_gen_pd(), auth=auth, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+                                        
+                            r = requests.post("https://pixeldrain.com/api/file", data=file_gen_pd(), auth=auth, headers=headers)
                             try:
                                 rj = r.json()
                                 if rj.get("id"): shared_prog['link'] = f"https://pixeldrain.com/u/{rj['id']}"
                                 else: shared_prog['error'] = f"Pixeldrain Error: {rj}"
                             except: shared_prog['error'] = f"Pixeldrain HTTP {r.status_code}"
 
-                        # 4. FILEMIRAGE (Chunked Upload)
+                        # 4. FILEMIRAGE
                         elif self.up_dest == "filemirage":
                             fm_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                             srv_r = requests.get("https://filemirage.com/api/servers", headers=fm_headers).json()
@@ -437,7 +453,7 @@ class TaskListener(TaskConfig):
                             if url: shared_prog['link'] = url
                             else: shared_prog['error'] = f"Filemirage Error: {last_rj}"
 
-                        # 5. PLAYER4ME (TUS Protocol Resumable Upload)
+                        # 5. PLAYER4ME
                         elif self.up_dest == "player4me":
                             if not api_key:
                                 shared_prog['error'] = "Player4me membutuhkan API Key (/setplayer4me)"
@@ -512,7 +528,6 @@ class TaskListener(TaskConfig):
             else:
                 await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
             
-            # --- Tidak ada return, skrip turun ke bawah agar file terhapus secara otomatis ---
         # ==========================================
         
         elif is_gdrive_id(self.up_dest) or getattr(self, 'up_dest', '') == "gd":
