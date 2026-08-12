@@ -350,4 +350,360 @@ class TaskListener(TaskConfig):
                         # 1. GOFILE
                         if self.up_dest == "gofile":
                             server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
-                            url = f"https://{server}.
+                            url = f"https://{server}.gofile.io/contents/uploadfile"
+                            boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
+                            
+                            def file_gen():
+                                head = (f"--{boundary}\r\n"
+                                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                                        f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
+                                yield head
+                                shared_prog['uploaded'] += len(head)
+                                
+                                if api_key:
+                                    tk = f"--{boundary}\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n{api_key}\r\n".encode('utf-8')
+                                    yield tk
+                                    shared_prog['uploaded'] += len(tk)
+                                    
+                                with open(target_path, 'rb') as f:
+                                    while chunk := f.read(262144):
+                                        yield chunk
+                                        shared_prog['uploaded'] += len(chunk)
+                                        
+                                tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
+                                yield tail
+                                shared_prog['uploaded'] += len(tail)
+                                
+                            headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
+                            res = requests.post(url, data=file_gen(), headers=headers).json()
+                            if res.get('status') == 'ok': shared_prog['link'] = res['data']['downloadPage']
+                            else: shared_prog['error'] = f"Gofile API Error: {res}"
+                        
+                        # 2. BUZZHEAVIER
+                        elif self.up_dest == "buzzheavier":
+                            fname = urllib.parse.quote(filename, safe="")
+                            url = f"https://w.buzzheavier.com/{fname}"
+                            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                            
+                            def file_gen_bh():
+                                with open(target_path, 'rb') as f:
+                                    while chunk := f.read(262144):
+                                        yield chunk
+                                        shared_prog['uploaded'] += len(chunk)
+                                        
+                            r = requests.put(url, data=file_gen_bh(), headers=headers)
+                            res = r.json()
+                            url_res = res.get("data", {}).get("url")
+                            if not url_res and res.get("data", {}).get("id"): url_res = f"https://buzzheavier.com/{res['data']['id']}"
+                            if url_res: shared_prog['link'] = url_res
+                            else: shared_prog['error'] = f"Buzzheavier Error: {res}"
+
+                        # 3. PIXELDRAIN
+                        elif self.up_dest == "pixeldrain":
+                            auth = ("", api_key) if api_key else None
+                            def file_gen_pd():
+                                with open(target_path, 'rb') as f:
+                                    while chunk := f.read(262144):
+                                        yield chunk
+                                        shared_prog['uploaded'] += len(chunk)
+                            r = requests.post("https://pixeldrain.com/api/file", data=file_gen_pd(), auth=auth, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+                            try:
+                                rj = r.json()
+                                if rj.get("id"): shared_prog['link'] = f"https://pixeldrain.com/u/{rj['id']}"
+                                else: shared_prog['error'] = f"Pixeldrain Error: {rj}"
+                            except: shared_prog['error'] = f"Pixeldrain HTTP {r.status_code}"
+
+                        # 4. FILEMIRAGE (Chunked Upload)
+                        elif self.up_dest == "filemirage":
+                            fm_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                            srv_r = requests.get("https://filemirage.com/api/servers", headers=fm_headers).json()
+                            server = srv_r["data"]["server"].rstrip("/")
+                            upload_id = srv_r["data"]["upload_id"]
+                            
+                            CHUNK_SIZE = 100 * 1024 * 1024
+                            total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
+                            
+                            last_rj = {}
+                            with open(target_path, "rb") as fh:
+                                for i in range(total_chunks):
+                                    chunk_data = fh.read(CHUNK_SIZE)
+                                    up_r = requests.post(f"{server}/upload.php", headers=fm_headers, 
+                                                         files={"file": (filename, chunk_data, "application/octet-stream")}, 
+                                                         data={"filename": filename, "upload_id": upload_id, "chunk_number": str(i), "total_chunks": str(total_chunks)})
+                                    shared_prog['uploaded'] += len(chunk_data)
+                                    if i == total_chunks - 1: last_rj = up_r.json()
+                            
+                            url = last_rj.get("data", {}).get("url")
+                            if url: shared_prog['link'] = url
+                            else: shared_prog['error'] = f"Filemirage Error: {last_rj}"
+
+                        # 5. PLAYER4ME (TUS Protocol Resumable Upload)
+                        elif self.up_dest == "player4me":
+                            if not api_key:
+                                shared_prog['error'] = "Player4me membutuhkan API Key (/setplayer4me)"
+                                return
+                            p4_head = {"api-token": api_key, "Accept": "application/json"}
+                            ep_j = requests.get("https://player4me.com/api/v1/video/upload", headers=p4_head).json()
+                            tus_url, access_token = ep_j.get("tusUrl", "").rstrip("/") + "/", ep_j.get("accessToken", "")
+                            
+                            metadata = f"accessToken {base64.b64encode(access_token.encode()).decode()},filename {base64.b64encode(filename.encode()).decode()},filetype {base64.b64encode('video/mp4'.encode()).decode()}"
+                            create_r = requests.post(tus_url, headers={"Tus-Resumable": "1.0.0", "Upload-Length": str(file_size), "Upload-Metadata": metadata, "Content-Length": "0", "api-token": api_key})
+                            
+                            upload_url = create_r.headers.get("Location", "")
+                            offset = 0
+                            with open(target_path, "rb") as fh:
+                                while offset < file_size:
+                                    chunk = fh.read(52428800) # 50MB per patch chunk
+                                    requests.patch(upload_url, data=chunk, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": str(offset), "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(chunk)), "api-token": api_key})
+                                    offset += len(chunk)
+                                    shared_prog['uploaded'] = offset
+                                    
+                            vid_id = upload_url.rstrip("/").split("/")[-1]
+                            shared_prog['link'] = f"https://player4me.com/video/{vid_id}"
+
+                    except Exception as e:
+                        shared_prog['error'] = str(e)
+                    finally:
+                        shared_prog['done'] = True
+
+                async def progress_updater():
+                    last_text = ""
+                    start_time = time.time()
+                    while not shared_prog['done']:
+                        await asyncio.sleep(3)
+                        if shared_prog['done']: break
+                        
+                        uploaded = shared_prog['uploaded']
+                        total = shared_prog['total']
+                        percent = (uploaded / total) * 100 if total > 0 else 0
+                        elapsed = time.time() - start_time
+                        speed = uploaded / elapsed if elapsed > 0 else 0
+                        
+                        bar_length = 15
+                        filled = int(bar_length * percent / 100)
+                        bar = "█" * filled + "▒" * (bar_length - filled)
+                        
+                        text = (f"⬆️ **Mengupload ke {self.up_dest.upper()}**\n"
+                                f"📁 `{self.name}`\n"
+                                f"[{bar}] {percent:.1f}%\n"
+                                f"**Processed:** {get_readable_file_size(uploaded)} / {get_readable_file_size(total)}\n"
+                                f"**Speed:** {get_readable_file_size(speed)}/s")
+                                
+                        if text != last_text:
+                            try:
+                                await ui_msg.edit_text(text)
+                                last_text = text
+                            except Exception:
+                                pass
+
+                updater_task = asyncio.create_task(progress_updater())
+                await asyncio.to_thread(sync_upload)
+                await updater_task
+                
+                if shared_prog['link']:
+                    pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {shared_prog['link']}"
+                else:
+                    pesan = f"❌ **Gagal Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\nError: {shared_prog['error']}"
+                    
+                try:
+                    await ui_msg.edit_text(pesan)
+                except:
+                    await send_message(self.message, pesan)
+            else:
+                await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
+            
+            # --- Tidak ada return, skrip turun ke bawah agar file terhapus secara otomatis ---
+        # ==========================================
+        
+        elif is_gdrive_id(self.up_dest) or getattr(self, 'up_dest', '') == "gd":
+            LOGGER.info(f"Gdrive Upload Name: {self.name}")
+            drive = GoogleDriveUpload(self, up_path)
+            async with task_dict_lock:
+                task_dict[self.mid] = GoogleDriveStatus(self, drive, gid, "up")
+            await gather(
+                update_status_message(self.message.chat.id),
+                sync_to_async(drive.upload),
+            )
+            del drive
+        else:
+            LOGGER.info(f"Rclone Upload Name: {self.name}")
+            RCTransfer = RcloneTransferHelper(self)
+            async with task_dict_lock:
+                task_dict[self.mid] = RcloneStatus(self, RCTransfer, gid, "up")
+            await gather(
+                update_status_message(self.message.chat.id),
+                RCTransfer.upload(up_path),
+            )
+            del RCTransfer
+
+        if self.seed:
+            await clean_target(self.up_dir)
+            async with queue_dict_lock:
+                if self.mid in non_queued_up:
+                    non_queued_up.remove(self.mid)
+            await start_from_queued()
+            return
+            
+        await clean_download(self.dir)
+        async with task_dict_lock:
+            if self.mid in task_dict:
+                del task_dict[self.mid]
+            count = len(task_dict)
+        if count == 0:
+            await self.clean()
+        else:
+            await update_status_message(self.message.chat.id)
+
+        async with queue_dict_lock:
+            if self.mid in non_queued_up:
+                non_queued_up.remove(self.mid)
+
+        await start_from_queued()
+
+    async def on_upload_complete(
+        self, link, files, folders, mime_type, rclone_path="", dir_id=""
+    ):
+        if (
+            self.is_super_chat
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
+        ):
+            await database.rm_complete_task(self.message.link)
+        msg = f"<b>Name: </b><code>{escape(self.name)}</code>\n\n<b>Size: </b>{get_readable_file_size(self.size)}"
+        LOGGER.info(f"Task Done: {self.name}")
+        if self.is_leech:
+            msg += f"\n<b>Total Files: </b>{folders}"
+            if mime_type != 0:
+                msg += f"\n<b>Corrupted Files: </b>{mime_type}"
+            msg += f"\n<b>cc: </b>{self.tag}\n\n"
+            if not files:
+                await send_message(self.message, msg)
+            else:
+                fmsg = ""
+                for index, (link, name) in enumerate(files.items(), start=1):
+                    fmsg += f"{index}. <a href='{link}'>{name}</a>\n"
+                    if len(fmsg.encode() + msg.encode()) > 4000:
+                        await send_message(self.message, msg + fmsg)
+                        await sleep(1)
+                        fmsg = ""
+                if fmsg != "":
+                    await send_message(self.message, msg + fmsg)
+        else:
+            msg += f"\n\n<b>Type: </b>{mime_type}"
+            if mime_type == "Folder":
+                msg += f"\n<b>SubFolders: </b>{folders}"
+                msg += f"\n<b>Files: </b>{files}"
+            if (
+                link
+                or rclone_path
+                and Config.RCLONE_SERVE_URL
+                and not self.private_link
+            ):
+                buttons = ButtonMaker()
+                if link:
+                    buttons.url_button("☁️ Cloud Link", link)
+                else:
+                    msg += f"\n\nPath: <code>{rclone_path}</code>"
+                if rclone_path and Config.RCLONE_SERVE_URL and not self.private_link:
+                    remote, rpath = rclone_path.split(":", 1)
+                    url_path = rutils.quote(f"{rpath}")
+                    share_url = f"{Config.RCLONE_SERVE_URL}/{remote}/{url_path}"
+                    if mime_type == "Folder":
+                        share_url += "/"
+                    buttons.url_button("🔗 Rclone Link", share_url)
+                if not rclone_path and dir_id:
+                    INDEX_URL = ""
+                    if self.private_link:
+                        INDEX_URL = self.user_dict.get("INDEX_URL", "") or ""
+                    elif Config.INDEX_URL:
+                        INDEX_URL = Config.INDEX_URL
+                    if INDEX_URL:
+                        share_url = f"{INDEX_URL}findpath?id={dir_id}"
+                        buttons.url_button("⚡ Index Link", share_url)
+                        if mime_type.startswith(("image", "video", "audio")):
+                            share_urls = f"{INDEX_URL}findpath?id={dir_id}&view=true"
+                            buttons.url_button("🌐 View Link", share_urls)
+                button = buttons.build_menu(2)
+            else:
+                msg += f"\n\nPath: <code>{rclone_path}</code>"
+                button = None
+            msg += f"\n\n<b>cc: </b>{self.tag}"
+            await send_message(self.message, msg, button)
+
+    async def on_download_error(self, error, button=None):
+        async with task_dict_lock:
+            if self.mid in task_dict:
+                del task_dict[self.mid]
+            count = len(task_dict)
+        await self.remove_from_same_dir()
+        msg = f"{self.tag} Download: {escape(str(error))}"
+        await send_message(self.message, msg, button)
+        if count == 0:
+            await self.clean()
+        else:
+            await update_status_message(self.message.chat.id)
+
+        if (
+            self.is_super_chat
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
+        ):
+            await database.rm_complete_task(self.message.link)
+
+        async with queue_dict_lock:
+            if self.mid in queued_dl:
+                queued_dl[self.mid].set()
+                del queued_dl[self.mid]
+            if self.mid in queued_up:
+                queued_up[self.mid].set()
+                del queued_up[self.mid]
+            if self.mid in non_queued_dl:
+                non_queued_dl.remove(self.mid)
+            if self.mid in non_queued_up:
+                non_queued_up.remove(self.mid)
+
+        await start_from_queued()
+        await sleep(3)
+        await clean_download(self.dir)
+        if self.up_dir:
+            await clean_download(self.up_dir)
+        if self.thumb and await aiopath.exists(self.thumb):
+            await remove(self.thumb)
+
+    async def on_upload_error(self, error):
+        async with task_dict_lock:
+            if self.mid in task_dict:
+                del task_dict[self.mid]
+            count = len(task_dict)
+        await send_message(self.message, f"{self.tag} {escape(str(error))}")
+        if count == 0:
+            await self.clean()
+        else:
+            await update_status_message(self.message.chat.id)
+
+        if (
+            self.is_super_chat
+            and Config.INCOMPLETE_TASK_NOTIFIER
+            and Config.DATABASE_URL
+        ):
+            await database.rm_complete_task(self.message.link)
+
+        async with queue_dict_lock:
+            if self.mid in queued_dl:
+                queued_dl[self.mid].set()
+                del queued_dl[self.mid]
+            if self.mid in queued_up:
+                queued_up[self.mid].set()
+                del queued_up[self.mid]
+            if self.mid in non_queued_dl:
+                non_queued_dl.remove(self.mid)
+            if self.mid in non_queued_up:
+                non_queued_up.remove(self.mid)
+
+        await start_from_queued()
+        await sleep(3)
+        await clean_download(self.dir)
+        if self.up_dir:
+            await clean_download(self.up_dir)
+        if self.thumb and await aiopath.exists(self.thumb):
+            await remove(self.thumb)
