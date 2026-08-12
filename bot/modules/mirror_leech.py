@@ -344,7 +344,6 @@ class Mirror(TaskListener):
         # ==========================================
         # SUNTIKAN UI TOMBOL (PIKABOT STYLE)
         # ==========================================
-        # Mengecek args["-up"] langsung untuk mem-bypass DEFAULT_UPLOAD sistem!
         if not args["-up"] and not self.is_leech: 
             buttons = InlineKeyboardMarkup([
                 [
@@ -354,6 +353,11 @@ class Mirror(TaskListener):
                 [
                     InlineKeyboardButton("GoFile", callback_data=f"updest_{self.message.id}_gofile"),
                     InlineKeyboardButton("Buzzheavier", callback_data=f"updest_{self.message.id}_buzzheavier")
+                ],
+                [
+                    InlineKeyboardButton("Pixeldrain", callback_data=f"updest_{self.message.id}_pixeldrain"),
+                    InlineKeyboardButton("Filemirage", callback_data=f"updest_{self.message.id}_filemirage"),
+                    InlineKeyboardButton("Player4me", callback_data=f"updest_{self.message.id}_player4me")
                 ]
             ])
 
@@ -363,10 +367,9 @@ class Mirror(TaskListener):
             PENDING_UI_TASKS[self.message.id] = self 
 
             try:
-                # Skrip JEDA di sini maksimal 60 detik agar tidak nge-hang
                 await asyncio.wait_for(self.ui_event.wait(), timeout=60.0)
             except asyncio.TimeoutError:
-                pass # Biarkan jalan pakai up_dest dari DEFAULT_UPLOAD jika user tidak merespon
+                pass
             finally:
                 if self.message.id in PENDING_UI_TASKS:
                     del PENDING_UI_TASKS[self.message.id]
