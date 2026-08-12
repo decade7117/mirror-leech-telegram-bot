@@ -3,8 +3,8 @@
  bot/modules/multi_uploader.py
  FITUR:
  - /gofile, /pixeldrain, /buzzheavier, /filemirage, /player4me, /akirabox
- - /transferit     → download video dari URL dan upload ke transfer.it (Playwright + Inject Token SID)
- - /cancelup       → Membatalkan proses download/upload yang sedang berjalan
+ - /transferit     → download video dari URL dan upload ke transfer.it (Guest Mode)
+ - Tombol Inline Cancel terintegrasi di semua proses
 ============================================================
 """
 
@@ -17,8 +17,8 @@ import asyncio
 import time
 
 from pyrogram.filters import command
-from pyrogram.handlers import MessageHandler
-from pyrogram.types import Message
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from ..core.telegram_manager import TgClient
 from ..helper.ext_utils.bot_utils import new_task
@@ -93,8 +93,7 @@ except Exception as _e:
 def _safe_json(r):
     try:
         text = r.text.strip()
-        if not text:
-            return None
+        if not text: return None
         import json
         return json.loads(text)
     except Exception:
@@ -113,7 +112,7 @@ def _download_url(url: str, dest: str, user_id: int):
             with open(dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
                     if _CANCEL_TASKS.get(user_id):
-                        return False, "Dibatalkan oleh pengguna (/cancelup)."
+                        return False, "Dibatalkan oleh pengguna."
                     f.write(chunk)
         return True, None
     except Exception as e:
@@ -129,35 +128,55 @@ def _find_file_in_downloads(name: str):
     return None
 
 
-# ── Upload: Gofile (Aman, Fix JSON) ───────────────────────────────────────────
+# ── Upload: Gofile ────────────────────────────────────────────────────────────
 async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
+    cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancelmulti_{user_id}")]])
+    
     try:
         server = requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"]
         url = f"https://{server}.gofile.io/contents/uploadfile"
         filename = os.path.basename(path)
+        total_size = os.path.getsize(path)
+        boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
         
-        shared_prog = {"uploaded": 0, "total": os.path.getsize(path), "done": False, "result": None}
+        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
 
         def sync_upload_chunk():
             try:
-                class ProgressTracker:
-                    def __init__(self, filepath):
-                        self.f = open(filepath, 'rb')
-                    def read(self, size=-1):
-                        chunk = self.f.read(size)
-                        shared_prog['uploaded'] += len(chunk)
-                        return chunk
-                    def seek(self, offset, whence=0): return self.f.seek(offset, whence)
-                    def tell(self): return self.f.tell()
-                    def close(self): self.f.close()
-
-                tr = ProgressTracker(path)
-                data = {'token': key} if key else {}
-                r = requests.post(url, files={'file': (filename, tr)}, data=data, timeout=600)
-                tr.close()
+                head = (f"--{boundary}\r\n"
+                        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                        f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
+                tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
                 
+                token_field = b""
+                if key:
+                    token_field = (f"--{boundary}\r\n"
+                                   f'Content-Disposition: form-data; name="token"\r\n\r\n'
+                                   f'{key}\r\n').encode('utf-8')
+                                   
+                total_length = len(head) + len(token_field) + total_size + len(tail)
+                
+                def file_gen():
+                    yield head
+                    shared_prog['uploaded'] += len(head)
+                    if key:
+                        yield token_field
+                        shared_prog['uploaded'] += len(token_field)
+                    with open(path, "rb") as f:
+                        while chunk := f.read(262144):
+                            if _CANCEL_TASKS.get(user_id): break
+                            yield chunk
+                            shared_prog['uploaded'] += len(chunk)
+                    yield tail
+                    shared_prog['uploaded'] += len(tail)
+
+                headers = {
+                    'Content-Type': f'multipart/form-data; boundary={boundary}',
+                    'Content-Length': str(total_length)
+                }
+                r = requests.post(url, data=file_gen(), headers=headers, timeout=600)
                 rj = _safe_json(r)
                 if rj and rj.get("status") == "ok": shared_prog['result'] = rj["data"]["downloadPage"]
                 else: shared_prog['result'] = f"❌ Gofile error: {r.text[:200]}"
@@ -177,7 +196,7 @@ async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message)
                 speed = uploaded / elapsed if elapsed > 0 else 0
                 bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
                 text = f"⬆️ **Mengupload ke GOFILE**\n📁 `{filename}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
-                try: await status_msg.edit(text)
+                try: await status_msg.edit(text, reply_markup=cancel_btn)
                 except: pass
 
         updater_task = asyncio.create_task(progress_updater())
@@ -192,29 +211,29 @@ async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message)
 async def _upload_pixeldrain(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
+    cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancelmulti_{user_id}")]])
+    
     try:
         filename = os.path.basename(path)
+        total_size = os.path.getsize(path)
         auth = ("", key) if key else None
         
-        shared_prog = {"uploaded": 0, "total": os.path.getsize(path), "done": False, "result": None}
+        shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
 
         def sync_upload_chunk():
             try:
-                class ProgressTracker:
-                    def __init__(self, filepath):
-                        self.f = open(filepath, 'rb')
-                    def read(self, size=-1):
-                        chunk = self.f.read(size)
-                        shared_prog['uploaded'] += len(chunk)
-                        return chunk
-                    def seek(self, offset, whence=0): return self.f.seek(offset, whence)
-                    def tell(self): return self.f.tell()
-                    def close(self): self.f.close()
+                def file_gen():
+                    with open(path, "rb") as f:
+                        while chunk := f.read(262144):
+                            if _CANCEL_TASKS.get(user_id): break
+                            yield chunk
+                            shared_prog['uploaded'] += len(chunk)
 
-                tr = ProgressTracker(path)
-                r = requests.post("https://pixeldrain.com/api/file", files={'file': (filename, tr)}, auth=auth, timeout=600)
-                tr.close()
-                
+                headers = {
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(total_size)
+                }
+                r = requests.post("https://pixeldrain.com/api/file", data=file_gen(), auth=auth, headers=headers, timeout=600)
                 rj = _safe_json(r)
                 if rj and rj.get("id"): shared_prog['result'] = f"https://pixeldrain.com/u/{rj['id']}"
                 else: shared_prog['result'] = f"❌ Pixeldrain error: {r.text[:200]}"
@@ -234,7 +253,7 @@ async def _upload_pixeldrain(path: str, key: str, user_id: int, status_msg: Mess
                 speed = uploaded / elapsed if elapsed > 0 else 0
                 bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
                 text = f"⬆️ **Mengupload ke PIXELDRAIN**\n📁 `{filename}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
-                try: await status_msg.edit(text)
+                try: await status_msg.edit(text, reply_markup=cancel_btn)
                 except: pass
 
         updater_task = asyncio.create_task(progress_updater())
@@ -245,10 +264,12 @@ async def _upload_pixeldrain(path: str, key: str, user_id: int, status_msg: Mess
         return f"❌ Pixeldrain exception: {e}"
 
 
-# ── Upload: Buzzheavier (Fix Error 411 Length Required) ───────────────────────
+# ── Upload: Buzzheavier ───────────────────────────────────────────────────────
 async def _upload_buzzheavier(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import requests
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
+    cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancelmulti_{user_id}")]])
+    
     try:
         fname = urllib.parse.quote(os.path.basename(path), safe="")
         total_size = os.path.getsize(path)
@@ -260,21 +281,14 @@ async def _upload_buzzheavier(path: str, key: str, user_id: int, status_msg: Mes
                 headers = {"Content-Length": str(total_size)}
                 if key: headers["Authorization"] = f"Bearer {key}"
                 
-                class ProgressTracker:
-                    def __init__(self, filepath):
-                        self.f = open(filepath, 'rb')
-                    def read(self, size=-1):
-                        chunk = self.f.read(size)
-                        shared_prog['uploaded'] += len(chunk)
-                        return chunk
-                    def seek(self, offset, whence=0): return self.f.seek(offset, whence)
-                    def tell(self): return self.f.tell()
-                    def close(self): self.f.close()
+                def file_gen():
+                    with open(path, "rb") as f:
+                        while chunk := f.read(262144):
+                            if _CANCEL_TASKS.get(user_id): break
+                            yield chunk
+                            shared_prog['uploaded'] += len(chunk)
 
-                tr = ProgressTracker(path)
-                r = requests.put(f"https://w.buzzheavier.com/{fname}", data=tr, headers=headers, timeout=600)
-                tr.close()
-                
+                r = requests.put(f"https://w.buzzheavier.com/{fname}", data=file_gen(), headers=headers, timeout=600)
                 rj = _safe_json(r)
                 if rj:
                     data = rj.get("data", {})
@@ -300,7 +314,7 @@ async def _upload_buzzheavier(path: str, key: str, user_id: int, status_msg: Mes
                 speed = uploaded / elapsed if elapsed > 0 else 0
                 bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
                 text = f"⬆️ **Mengupload ke BUZZHEAVIER**\n📁 `{os.path.basename(path)}`\n[{bar}] {percent:.1f}%\n**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n**Speed:** {_sizeof_fmt(speed)}/s"
-                try: await status_msg.edit(text)
+                try: await status_msg.edit(text, reply_markup=cancel_btn)
                 except: pass
 
         updater_task = asyncio.create_task(progress_updater())
@@ -347,26 +361,20 @@ def _upload_filemirage(path: str, key: str, user_id: int) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (Inject SID + Playwright Automation) ──────────────────
+# ── Upload: Transfer.it (Revert ke Guest Mode Playwright, Anti Stuck) ─────────
 async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
     from playwright.async_api import async_playwright
     from .. import LOGGER
 
-    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan."
+    if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
+    cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancelmulti_{user_id}")]])
     
     LOGGER.info(f"[Transfer.it] Memulai upload Playwright untuk: {os.path.basename(path)}")
-    await status_msg.edit("🚀 **Transfer.it:** Menjalankan mesin Playwright (Bypass Login)...")
+    await status_msg.edit("🚀 **Transfer.it:** Menyiapkan browser (Guest Mode)...", reply_markup=cancel_btn)
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-        
-        # SUNTIKAN SID AGAR BYPASS HALAMAN LOGIN
-        if key and ":" not in key:
-            await context.add_cookies([{
-                'name': 'sid', 'value': key, 'domain': '.transfer.it', 'path': '/'
-            }])
-            
         page = await context.new_page()
         try:
             await page.goto("https://transfer.it/")
@@ -389,7 +397,7 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
             wait_time = 0
             while True:
                 if _CANCEL_TASKS.get(user_id):
-                    return "❌ Dibatalkan oleh pengguna (/cancelup)."
+                    return "❌ Dibatalkan oleh pengguna."
                 if await page.locator("text='Completed!':visible").first.is_visible():
                     break
                 await asyncio.sleep(5)
@@ -402,9 +410,9 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
                             prog_text = await prog_loc.inner_text()
                     except: pass
                     try:
-                        msg = f"⬆️ Mengupload ke **Transfer.it**…\n⏳ Waktu: **{wait_time}s**\n"
-                        if prog_text: msg += f"📊 <code>{prog_text}</code>\n\n"
-                        await status_msg.edit(msg)
+                        msg = f"⬆️ Mengupload ke **Transfer.it** (Guest)…\n⏳ Waktu: **{wait_time}s**\n"
+                        if prog_text: msg += f"📊 <code>{prog_text}</code>\n"
+                        await status_msg.edit(msg, reply_markup=cancel_btn)
                     except: pass
                     
             link_element = page.locator("input[readonly]:visible").first
@@ -462,6 +470,18 @@ async def cancel_upload_cmd(_, message: Message):
     _CANCEL_TASKS[message.from_user.id] = True
     await message.reply("🛑 Pembatalan dikirim...")
 
+# Handler untuk tombol inline cancel
+@new_task
+async def cancel_multi_callback(client, query):
+    data = query.data.split("_")
+    if data[0] == "cancelmulti":
+        uid = int(data[1])
+        if query.from_user.id == uid:
+            _CANCEL_TASKS[uid] = True
+            await query.answer("🛑 Proses dibatalkan!", show_alert=True)
+        else:
+            await query.answer("❌ Ini bukan tugas Anda!", show_alert=True)
+
 @new_task
 async def multi_mirror_cmd(_, message):
     parts = message.text.strip().split(maxsplit=1)
@@ -479,7 +499,9 @@ async def multi_mirror_cmd(_, message):
     arg = parts[1].strip()
     is_url = arg.startswith(("http://", "https://"))
     is_abs = arg.startswith("/")
-    status_msg = await message.reply("🔍 Memproses…")
+    
+    cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancelmulti_{user_id}")]])
+    status_msg = await message.reply("🔍 Memproses…", reply_markup=cancel_btn)
 
     need_del = False
     dest = None
@@ -488,7 +510,7 @@ async def multi_mirror_cmd(_, message):
         fname = arg.split("/")[-1].split("?")[0].strip() or "file_download"
         os.makedirs(TEMP_DIR, exist_ok=True)
         dest = os.path.join(TEMP_DIR, fname)
-        await status_msg.edit(f"⬇️ Mengunduh dari URL…\n<code>{arg}</code>")
+        await status_msg.edit(f"⬇️ Mengunduh dari URL…\n<code>{arg}</code>", reply_markup=cancel_btn)
         ok, err = await to_thread(_download_url, arg, dest, user_id)
         if not ok:
             await status_msg.edit(f"❌ Gagal download: {err}")
@@ -526,3 +548,4 @@ async def multi_mirror_cmd(_, message):
 TgClient.bot.add_handler(MessageHandler(set_api_key_cmd, filters=command(SET_HOST_LIST) & CustomFilters.sudo))
 TgClient.bot.add_handler(MessageHandler(multi_mirror_cmd, filters=command(HOST_LIST) & CustomFilters.authorized))
 TgClient.bot.add_handler(MessageHandler(cancel_upload_cmd, filters=command("cancelup") & CustomFilters.authorized))
+TgClient.bot.add_handler(CallbackQueryHandler(cancel_multi_callback, filters=lambda _, q: q.data.startswith("cancelmulti_")))
