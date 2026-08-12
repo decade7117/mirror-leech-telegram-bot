@@ -304,7 +304,7 @@ class TaskListener(TaskConfig):
 
         # ==========================================
         # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & ANTI-HANTU
-        # (FIX CONTENT-LENGTH AVOIDING ERROR 411 & JSON EXPECTING VALUE)
+        # (FIX GOFILE ERROR & BUZZHEAVIER 411 ERROR DENGAN FILE WRAPPER AMAN)
         # ==========================================
         elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier", "pixeldrain", "filemirage", "player4me"]:
             LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
@@ -323,16 +323,13 @@ class TaskListener(TaskConfig):
                 
             api_key = _API_KEYS.get(self.up_dest, "")
             
-            # ---> Basmi Hantu Pesan Pause 100% dengan Aman <---
             async with task_dict_lock:
                 if self.mid in task_dict:
                     del task_dict[self.mid]
                 tasks_count = len(task_dict)
             
-            if tasks_count == 0:
-                await self.clean() 
-            else:
-                await update_status_message(self.message.chat.id)
+            if tasks_count == 0: await self.clean() 
+            else: await update_status_message(self.message.chat.id)
             
             target_path = os.path.join(self.dir, self.name)
             
@@ -346,90 +343,63 @@ class TaskListener(TaskConfig):
                         filename = os.path.basename(target_path)
                         file_size = shared_prog['total']
                         
-                        # 1. GOFILE (Fix JSON Error)
+                        # WRAPPER PINTAR: Menghitung persentase tanpa merusak standar HTTP Content-Length!
+                        class ProgressTracker:
+                            def __init__(self, filepath):
+                                self.f = open(filepath, 'rb')
+                            def read(self, size=-1):
+                                chunk = self.f.read(size)
+                                shared_prog['uploaded'] += len(chunk)
+                                return chunk
+                            def seek(self, offset, whence=0): return self.f.seek(offset, whence)
+                            def tell(self): return self.f.tell()
+                            def close(self): self.f.close()
+
+                        # 1. GOFILE (Metode Aman Tanpa Manual Boundary)
                         if self.up_dest == "gofile":
                             server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
                             url = f"https://{server}.gofile.io/contents/uploadfile"
-                            boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW'
                             
-                            head = (f"--{boundary}\r\n"
-                                    f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-                                    f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8')
-                            tail = f"\r\n--{boundary}--\r\n".encode('utf-8')
+                            tr = ProgressTracker(target_path)
+                            data = {'token': api_key} if api_key else {}
+                            res = requests.post(url, files={'file': (filename, tr)}, data=data).json()
+                            tr.close()
                             
-                            token_field = b""
-                            if api_key:
-                                token_field = (f"--{boundary}\r\n"
-                                               f'Content-Disposition: form-data; name="token"\r\n\r\n'
-                                               f'{api_key}\r\n').encode('utf-8')
-                                               
-                            # Kalkulasi Content-Length akurat agar server Gofile tidak menolak
-                            total_length = len(head) + len(token_field) + file_size + len(tail)
-                            
-                            def file_gen():
-                                yield head
-                                shared_prog['uploaded'] += len(head)
-                                if api_key:
-                                    yield token_field
-                                    shared_prog['uploaded'] += len(token_field)
-                                with open(target_path, 'rb') as f:
-                                    while chunk := f.read(262144):
-                                        yield chunk
-                                        shared_prog['uploaded'] += len(chunk)
-                                yield tail
-                                shared_prog['uploaded'] += len(tail)
-                                
-                            headers = {
-                                'Content-Type': f'multipart/form-data; boundary={boundary}',
-                                'Content-Length': str(total_length) # INI OBAT PENAWARNYA!
-                            }
-                            res = requests.post(url, data=file_gen(), headers=headers).json()
                             if res.get('status') == 'ok': shared_prog['link'] = res['data']['downloadPage']
-                            else: shared_prog['error'] = f"Gofile API Error: {res}"
+                            else: shared_prog['error'] = f"Gofile Error: {res}"
                         
-                        # 2. BUZZHEAVIER (Fix Error 411 Length Required)
+                        # 2. BUZZHEAVIER (Fix Error 411)
                         elif self.up_dest == "buzzheavier":
                             fname = urllib.parse.quote(filename, safe="")
                             url = f"https://w.buzzheavier.com/{fname}"
                             
-                            # Wajib memasukkan Content-Length
                             headers = {"Content-Length": str(file_size)}
                             if api_key: headers["Authorization"] = f"Bearer {api_key}"
                             
-                            def file_gen_bh():
-                                with open(target_path, 'rb') as f:
-                                    while chunk := f.read(262144):
-                                        yield chunk
-                                        shared_prog['uploaded'] += len(chunk)
-                                        
-                            r = requests.put(url, data=file_gen_bh(), headers=headers)
+                            tr = ProgressTracker(target_path)
+                            r = requests.put(url, data=tr, headers=headers)
+                            tr.close()
+                            
                             res = r.json()
                             url_res = res.get("data", {}).get("url")
                             if not url_res and res.get("data", {}).get("id"): url_res = f"https://buzzheavier.com/{res['data']['id']}"
                             if url_res: shared_prog['link'] = url_res
                             else: shared_prog['error'] = f"Buzzheavier Error: {res}"
 
-                        # 3. PIXELDRAIN (Fix Chunked Issue)
+                        # 3. PIXELDRAIN
                         elif self.up_dest == "pixeldrain":
                             auth = ("", api_key) if api_key else None
-                            headers = {
-                                "Content-Disposition": f'attachment; filename="{filename}"',
-                                "Content-Length": str(file_size)
-                            }
-                            def file_gen_pd():
-                                with open(target_path, 'rb') as f:
-                                    while chunk := f.read(262144):
-                                        yield chunk
-                                        shared_prog['uploaded'] += len(chunk)
-                                        
-                            r = requests.post("https://pixeldrain.com/api/file", data=file_gen_pd(), auth=auth, headers=headers)
+                            tr = ProgressTracker(target_path)
+                            r = requests.post("https://pixeldrain.com/api/file", files={'file': (filename, tr)}, auth=auth)
+                            tr.close()
+                            
                             try:
                                 rj = r.json()
                                 if rj.get("id"): shared_prog['link'] = f"https://pixeldrain.com/u/{rj['id']}"
                                 else: shared_prog['error'] = f"Pixeldrain Error: {rj}"
                             except: shared_prog['error'] = f"Pixeldrain HTTP {r.status_code}"
 
-                        # 4. FILEMIRAGE
+                        # 4. FILEMIRAGE (Aman)
                         elif self.up_dest == "filemirage":
                             fm_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                             srv_r = requests.get("https://filemirage.com/api/servers", headers=fm_headers).json()
@@ -453,7 +423,7 @@ class TaskListener(TaskConfig):
                             if url: shared_prog['link'] = url
                             else: shared_prog['error'] = f"Filemirage Error: {last_rj}"
 
-                        # 5. PLAYER4ME
+                        # 5. PLAYER4ME (Aman)
                         elif self.up_dest == "player4me":
                             if not api_key:
                                 shared_prog['error'] = "Player4me membutuhkan API Key (/setplayer4me)"
@@ -469,7 +439,7 @@ class TaskListener(TaskConfig):
                             offset = 0
                             with open(target_path, "rb") as fh:
                                 while offset < file_size:
-                                    chunk = fh.read(52428800) # 50MB per patch chunk
+                                    chunk = fh.read(52428800)
                                     requests.patch(upload_url, data=chunk, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": str(offset), "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(chunk)), "api-token": api_key})
                                     offset += len(chunk)
                                     shared_prog['uploaded'] = offset
