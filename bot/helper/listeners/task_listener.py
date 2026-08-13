@@ -355,18 +355,24 @@ class TaskListener(TaskConfig):
                             def tell(self): return self.f.tell()
                             def close(self): self.f.close()
 
-                        # 1. GOFILE (Metode Aman Tanpa Manual Boundary)
+                        # 1. GOFILE (Metode Aman & Cegat Error Server Down)
                         if self.up_dest == "gofile":
                             server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
                             url = f"https://{server}.gofile.io/contents/uploadfile"
                             
                             tr = ProgressTracker(target_path)
                             data = {'token': api_key} if api_key else {}
-                            res = requests.post(url, files={'file': (filename, tr)}, data=data).json()
+                            r = requests.post(url, files={'file': (filename, tr)}, data=data)
                             tr.close()
                             
-                            if res.get('status') == 'ok': shared_prog['link'] = res['data']['downloadPage']
-                            else: shared_prog['error'] = f"Gofile Error: {res}"
+                            try:
+                                res = r.json()
+                                if res.get('status') == 'ok': 
+                                    shared_prog['link'] = res['data']['downloadPage']
+                                else: 
+                                    shared_prog['error'] = f"Gofile Error: {res}"
+                            except Exception:
+                                shared_prog['error'] = f"Server GoFile Sedang Down/Penuh (HTTP {r.status_code}). Silakan coba host lain."
                         
                         # 2. BUZZHEAVIER (Fix Error 411)
                         elif self.up_dest == "buzzheavier":
