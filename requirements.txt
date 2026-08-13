@@ -26,7 +26,7 @@ kurigram
 python-magic
 requests
 telegraph
-tenacity
+tenacity>=8.2.3
 tgcrypto
 urllib3
 uvicorn
