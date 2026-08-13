@@ -177,9 +177,14 @@ async def _upload_gofile(path: str, key: str, user_id: int, status_msg: Message)
                     'Content-Length': str(total_length)
                 }
                 r = requests.post(url, data=file_gen(), headers=headers, timeout=600)
-                rj = _safe_json(r)
-                if rj and rj.get("status") == "ok": shared_prog['result'] = rj["data"]["downloadPage"]
-                else: shared_prog['result'] = f"❌ Gofile error: {r.text[:200]}"
+                
+                # CEGAT ERROR GOFILE SERVER DOWN/PENUH
+                try:
+                    rj = r.json()
+                    if rj and rj.get("status") == "ok": shared_prog['result'] = rj["data"]["downloadPage"]
+                    else: shared_prog['result'] = f"❌ Gofile error: {rj}"
+                except Exception:
+                    shared_prog['result'] = f"❌ Server GoFile Sedang Down/Penuh (HTTP {r.status_code}). Silakan coba host lain."
             except Exception as e:
                 shared_prog['result'] = f"❌ Gofile exception: {e}"
             finally:
