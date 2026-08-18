@@ -38,6 +38,7 @@ from ..helper.ext_utils.bot_utils import new_task
 BILI_DIR = Path("/app/bili_accounts")
 BILI_DIR.mkdir(parents=True, exist_ok=True)
 BILI_SETTINGS_FILE = BILI_DIR / "settings.json"
+RETRY_DB_FILE = BILI_DIR / "retry_tasks.json"  # <-- DATABASE RETRY IMMORTAL
 
 DEFAULT_SETTINGS = {
     "tags": ["anime", "indonesia"],
@@ -47,11 +48,6 @@ DEFAULT_SETTINGS = {
     "account_mode": "round_robin", 
 }
 
-_login_sessions: dict = {}
-_CANCEL_BILI: dict = {}
-_RETRY_TASKS: dict = {}  
-bili_upload_lock = asyncio.Lock()
-
 def load_settings() -> dict:
     if BILI_SETTINGS_FILE.exists():
         try: return json.loads(BILI_SETTINGS_FILE.read_text())
@@ -60,6 +56,21 @@ def load_settings() -> dict:
 
 def save_settings(s: dict):
     BILI_SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False))
+
+# FUNGSI DATABASE RETRY
+def load_retry_tasks() -> dict:
+    if RETRY_DB_FILE.exists():
+        try: return json.loads(RETRY_DB_FILE.read_text())
+        except: pass
+    return {}
+
+def save_retry_tasks(t: dict):
+    RETRY_DB_FILE.write_text(json.dumps(t, indent=2, ensure_ascii=False))
+
+_login_sessions: dict = {}
+_CANCEL_BILI: dict = {}
+_RETRY_TASKS: dict = load_retry_tasks()  # <-- Load otomatis saat bot restart
+bili_upload_lock = asyncio.Lock()
 
 def list_accounts() -> list[dict]:
     accounts = []
@@ -85,7 +96,6 @@ def _sizeof_fmt(num_bytes: int) -> str:
     return f"{num_bytes / 1024:.2f} KB"
 
 async def _download_video_async(url: str, user_id: int, shared_prog: dict) -> tuple[str | None, str | None]:
-    """Download menggunakan httpx murni untuk mencegah stuck & mendeteksi file korup (VPN Drop)"""
     try:
         filename = url.rstrip("/").split("/")[-1].split("?")[0] or f"vid_{int(time.time())}.mp4"
         tmp_path = f"/tmp/{filename}"
@@ -107,7 +117,6 @@ async def _download_video_async(url: str, user_id: int, shared_prog: dict) -> tu
                         f.write(chunk)
                         shared_prog["dl_downloaded"] += len(chunk)
                         
-                # Validasi Anti-Korup: Pastikan ukuran yang didownload = Content Length
                 if total_size > 0 and shared_prog["dl_downloaded"] < total_size:
                     raise Exception(f"Download terputus sebelum selesai (Hanya dpt {shared_prog['dl_downloaded']} dari {total_size} bytes). Koneksi/VPN mungkin mati.")
                     
@@ -170,7 +179,6 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
                 f.seek(start)
                 chunk_data = f.read(end - start)
                 
-                # Toleransi 5x percobaan per chunk jika user sedang ganti VPN
                 for attempt in range(5):
                     try:
                         r = await client.put(upload_url, params={"partNumber": chunk_idx+1, "uploadId": upload_id, "chunk": chunk_idx, "chunks": total_chunks, "size": end-start, "start": start, "end": end, "total": filesize}, content=chunk_data, headers=upos_headers, timeout=120)
@@ -454,6 +462,7 @@ async def bili_upload_cmd(client, message: Message):
             "url": url, "title": title, "desc": desc, "tags_str": tags_str, 
             "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id, "mode": mode
         }
+        save_retry_tasks(_RETRY_TASKS)  # SIMPAN KE DATABASE
         
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Semua ({len(failed_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
         await status_msg.edit(f"❌ <b>Download gagal/Batal:</b> {err_msg}", reply_markup=reply_markup)
@@ -467,6 +476,7 @@ async def bili_upload_cmd(client, message: Message):
             "url": url, "title": title, "desc": desc, "tags_str": tags_str, 
             "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id, "mode": mode
         }
+        save_retry_tasks(_RETRY_TASKS)  # SIMPAN KE DATABASE
         
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi yang Gagal ({len(failed_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
         await status_msg.edit(text_result, reply_markup=reply_markup)
@@ -518,6 +528,7 @@ async def bili_callback(client, query: CallbackQuery):
             if _CANCEL_BILI.get(user_id):
                 await query.message.edit(f"🛑 <b>Retry dibatalkan manual:</b> {err_msg}")
                 _RETRY_TASKS.pop(task_id, None)
+                save_retry_tasks(_RETRY_TASKS) # UPDATE DATABASE
                 return
                 
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Download (Sisa {len(target_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
@@ -528,11 +539,13 @@ async def bili_callback(client, query: CallbackQuery):
         
         if new_failed_accounts:
             _RETRY_TASKS[task_id]["failed_accounts"] = new_failed_accounts
+            save_retry_tasks(_RETRY_TASKS)  # UPDATE DATABASE
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Sisa {len(new_failed_accounts)} Akun Gagal", callback_data=f"bili_retry_{task_id}")]])
             await query.message.edit(text_result, reply_markup=markup)
         else:
             await query.message.edit(text_result)
             _RETRY_TASKS.pop(task_id, None)
+            save_retry_tasks(_RETRY_TASKS)  # BERSIHKAN DATABASE JIKA SUKSES SEMUA
 
 TgClient.bot.add_handler(MessageHandler(bili_login_cmd, filters=filters.command("bililogin") & CustomFilters.authorized))
 TgClient.bot.add_handler(MessageHandler(bili_receive_cookie_file, filters=filters.document & CustomFilters.authorized))
