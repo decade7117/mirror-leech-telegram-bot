@@ -19,6 +19,7 @@ import time
 import uuid
 import math
 import httpx
+import random
 from pathlib import Path
 
 from pyrogram import filters
@@ -38,7 +39,7 @@ from ..helper.ext_utils.bot_utils import new_task
 BILI_DIR = Path("/app/bili_accounts")
 BILI_DIR.mkdir(parents=True, exist_ok=True)
 BILI_SETTINGS_FILE = BILI_DIR / "settings.json"
-RETRY_DB_FILE = BILI_DIR / "retry_tasks.json"  # <-- DATABASE RETRY IMMORTAL
+RETRY_DB_FILE = BILI_DIR / "retry_tasks.json"
 
 DEFAULT_SETTINGS = {
     "tags": ["anime", "indonesia"],
@@ -57,7 +58,6 @@ def load_settings() -> dict:
 def save_settings(s: dict):
     BILI_SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False))
 
-# FUNGSI DATABASE RETRY
 def load_retry_tasks() -> dict:
     if RETRY_DB_FILE.exists():
         try: return json.loads(RETRY_DB_FILE.read_text())
@@ -69,7 +69,7 @@ def save_retry_tasks(t: dict):
 
 _login_sessions: dict = {}
 _CANCEL_BILI: dict = {}
-_RETRY_TASKS: dict = load_retry_tasks()  # <-- Load otomatis saat bot restart
+_RETRY_TASKS: dict = load_retry_tasks()
 bili_upload_lock = asyncio.Lock()
 
 def list_accounts() -> list[dict]:
@@ -243,8 +243,8 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
                 text += f"Speed: {_sizeof_fmt(speed)}/s"
                 
             elif shared_prog["status"] == "Uploading":
-                if mode == "queue_oneall":
-                    text += f"🚀 **Upload Paralel ({len(target_accounts)} Akun):**\n"
+                if mode in ("queue_oneall", "batch_5"):
+                    text += f"🚀 **Upload Paralel (Maks 4 Bersamaan):**\n"
                 else:
                     text += f"🚀 **Upload Sekuensial:**\n"
                     
@@ -252,8 +252,10 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
                     pct = (prog["uploaded"] / prog["total"]) * 100 if prog["total"] > 0 else 0
                     if pct == 100:
                         text += f"✅ {acc_name}: Selesai\n"
-                    else:
+                    elif pct > 0:
                         text += f"⏳ {acc_name}: {pct:.1f}%\n"
+                    else:
+                        text += f"⏱ {acc_name}: Menunggu antrean...\n"
             
             text += "\n<i>Ketik /cancelbili untuk batal</i>"
             
@@ -277,11 +279,18 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
     failed_accounts = []
     
     try:
-        if mode == "queue_oneall":
+        if mode in ("queue_oneall", "batch_5"):
+            # LAMPU MERAH: Maksimal 4 akun berbarengan agar tidak kena Error 412 Bilibili WAF
+            sem = asyncio.Semaphore(4)
+            
+            async def safe_upload(acc):
+                async with sem:
+                    return await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog)
+            
             tasks = []
             for acc in target_accounts:
                 shared_prog["up_progress"][acc["name"]] = {"uploaded": 0, "total": os.path.getsize(video_path)}
-                tasks.append(_do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog))
+                tasks.append(safe_upload(acc))
             
             res_list = await asyncio.gather(*tasks, return_exceptions=True)
             
@@ -392,14 +401,15 @@ async def bili_set_cmd(client, message: Message):
     text = message.text or message.caption or ""
     args = text.split(maxsplit=2)
     settings = load_settings()
-    if len(args) < 3: return await message.reply("Cara pakai:\n/biliset tags anime,gaming\n/biliset mode queue_oneall\n/biliset prefix Judul")
+    if len(args) < 3: return await message.reply("Cara pakai:\n/biliset mode batch_5\n/biliset mode queue_oneall\n/biliset tags anime")
     key, val = args[1].lower(), args[2].strip()
     
     if key == "tags":
         settings["tags"] = [t.strip().lstrip("#") for t in val.split(",") if t.strip()]
         await message.reply(f"✅ Tags diset: {' '.join(f'#{t}' for t in settings['tags'])}")
     elif key == "mode":
-        if val not in ("all", "round_robin", "queue_oneall"): return await message.reply("❌ Mode harus 'all', 'round_robin', atau 'queue_oneall'")
+        if val not in ("all", "round_robin", "queue_oneall", "batch_5"): 
+            return await message.reply("❌ Mode harus 'all', 'round_robin', 'queue_oneall', atau 'batch_5'")
         settings["account_mode"] = val
         await message.reply(f"✅ Mode akun diset: <b>{val}</b>")
     elif key == "prefix":
@@ -443,8 +453,12 @@ async def bili_upload_cmd(client, message: Message):
     tags_str = ",".join(settings.get("tags", []))
     
     mode = settings.get("account_mode", "round_robin")
-    if mode in ("all", "queue_oneall"): target_accounts = accounts
-    else: target_accounts = [accounts[int(time.time()) % len(accounts)]]
+    if mode in ("all", "queue_oneall"): 
+        target_accounts = accounts
+    elif mode == "batch_5":
+        target_accounts = random.sample(accounts, min(5, len(accounts)))
+    else: 
+        target_accounts = [accounts[int(time.time()) % len(accounts)]]
 
     if bili_upload_lock.locked(): status_msg = await message.reply(f"⏳ <b>Menunggu antrean Bilibili...</b>\n📝 {title}")
     else: status_msg = await message.reply(f"🔄 Memulai Bilibili...\n📝 {title}")
@@ -462,7 +476,7 @@ async def bili_upload_cmd(client, message: Message):
             "url": url, "title": title, "desc": desc, "tags_str": tags_str, 
             "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id, "mode": mode
         }
-        save_retry_tasks(_RETRY_TASKS)  # SIMPAN KE DATABASE
+        save_retry_tasks(_RETRY_TASKS)
         
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Semua ({len(failed_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
         await status_msg.edit(f"❌ <b>Download gagal/Batal:</b> {err_msg}", reply_markup=reply_markup)
@@ -476,7 +490,7 @@ async def bili_upload_cmd(client, message: Message):
             "url": url, "title": title, "desc": desc, "tags_str": tags_str, 
             "custom_cover": custom_cover, "failed_accounts": failed_accounts, "user_id": user_id, "mode": mode
         }
-        save_retry_tasks(_RETRY_TASKS)  # SIMPAN KE DATABASE
+        save_retry_tasks(_RETRY_TASKS)
         
         reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi yang Gagal ({len(failed_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
         await status_msg.edit(text_result, reply_markup=reply_markup)
@@ -528,7 +542,7 @@ async def bili_callback(client, query: CallbackQuery):
             if _CANCEL_BILI.get(user_id):
                 await query.message.edit(f"🛑 <b>Retry dibatalkan manual:</b> {err_msg}")
                 _RETRY_TASKS.pop(task_id, None)
-                save_retry_tasks(_RETRY_TASKS) # UPDATE DATABASE
+                save_retry_tasks(_RETRY_TASKS)
                 return
                 
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Download (Sisa {len(target_accounts)} Akun)", callback_data=f"bili_retry_{task_id}")]])
@@ -539,13 +553,13 @@ async def bili_callback(client, query: CallbackQuery):
         
         if new_failed_accounts:
             _RETRY_TASKS[task_id]["failed_accounts"] = new_failed_accounts
-            save_retry_tasks(_RETRY_TASKS)  # UPDATE DATABASE
+            save_retry_tasks(_RETRY_TASKS)
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"🔄 Ulangi Sisa {len(new_failed_accounts)} Akun Gagal", callback_data=f"bili_retry_{task_id}")]])
             await query.message.edit(text_result, reply_markup=markup)
         else:
             await query.message.edit(text_result)
             _RETRY_TASKS.pop(task_id, None)
-            save_retry_tasks(_RETRY_TASKS)  # BERSIHKAN DATABASE JIKA SUKSES SEMUA
+            save_retry_tasks(_RETRY_TASKS)
 
 TgClient.bot.add_handler(MessageHandler(bili_login_cmd, filters=filters.command("bililogin") & CustomFilters.authorized))
 TgClient.bot.add_handler(MessageHandler(bili_receive_cookie_file, filters=filters.document & CustomFilters.authorized))
