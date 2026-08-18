@@ -304,9 +304,9 @@ class TaskListener(TaskConfig):
 
         # ==========================================
         # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & ANTI-HANTU
-        # (FIX GOFILE ERROR & BUZZHEAVIER 411 ERROR DENGAN FILE WRAPPER AMAN)
         # ==========================================
-        elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier", "pixeldrain", "filemirage", "player4me"]:
+        # DITAMBAHKAN "transferit" DI SINI
+        elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier", "pixeldrain", "filemirage", "player4me", "transferit"]:
             LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
             import requests
             import os
@@ -343,7 +343,6 @@ class TaskListener(TaskConfig):
                         filename = os.path.basename(target_path)
                         file_size = shared_prog['total']
                         
-                        # WRAPPER PINTAR: Menghitung persentase tanpa merusak standar HTTP Content-Length!
                         class ProgressTracker:
                             def __init__(self, filepath):
                                 self.f = open(filepath, 'rb')
@@ -355,7 +354,7 @@ class TaskListener(TaskConfig):
                             def tell(self): return self.f.tell()
                             def close(self): self.f.close()
 
-                        # 1. GOFILE (Metode Aman & Cegat Error Server Down)
+                        # 1. GOFILE
                         if self.up_dest == "gofile":
                             server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
                             url = f"https://{server}.gofile.io/contents/uploadfile"
@@ -374,7 +373,7 @@ class TaskListener(TaskConfig):
                             except Exception:
                                 shared_prog['error'] = f"Server GoFile Sedang Down/Penuh (HTTP {r.status_code}). Silakan coba host lain."
                         
-                        # 2. BUZZHEAVIER (Fix Error 411)
+                        # 2. BUZZHEAVIER
                         elif self.up_dest == "buzzheavier":
                             fname = urllib.parse.quote(filename, safe="")
                             url = f"https://w.buzzheavier.com/{fname}"
@@ -405,7 +404,7 @@ class TaskListener(TaskConfig):
                                 else: shared_prog['error'] = f"Pixeldrain Error: {rj}"
                             except: shared_prog['error'] = f"Pixeldrain HTTP {r.status_code}"
 
-                        # 4. FILEMIRAGE (Aman)
+                        # 4. FILEMIRAGE
                         elif self.up_dest == "filemirage":
                             fm_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                             srv_r = requests.get("https://filemirage.com/api/servers", headers=fm_headers).json()
@@ -429,7 +428,7 @@ class TaskListener(TaskConfig):
                             if url: shared_prog['link'] = url
                             else: shared_prog['error'] = f"Filemirage Error: {last_rj}"
 
-                        # 5. PLAYER4ME (Aman)
+                        # 5. PLAYER4ME
                         elif self.up_dest == "player4me":
                             if not api_key:
                                 shared_prog['error'] = "Player4me membutuhkan API Key (/setplayer4me)"
@@ -453,6 +452,19 @@ class TaskListener(TaskConfig):
                             vid_id = upload_url.rstrip("/").split("/")[-1]
                             shared_prog['link'] = f"https://player4me.com/video/{vid_id}"
 
+                        # 6. TRANSFER.IT
+                        elif self.up_dest == "transferit":
+                            try:
+                                from transferit import Transferit
+                                with Transferit() as tx:
+                                    res = tx.upload(target_path)
+                                    shared_prog['link'] = res.url
+                                    shared_prog['uploaded'] = file_size # Set full ke 100% saat selesai
+                            except ImportError:
+                                shared_prog['error'] = "Library transferit-py belum terinstall. Pastikan sudah direbuild."
+                            except Exception as e:
+                                shared_prog['error'] = f"Transfer.it Error: {str(e)}"
+
                     except Exception as e:
                         shared_prog['error'] = str(e)
                     finally:
@@ -475,11 +487,18 @@ class TaskListener(TaskConfig):
                         filled = int(bar_length * percent / 100)
                         bar = "█" * filled + "▒" * (bar_length - filled)
                         
-                        text = (f"⬆️ **Mengupload ke {self.up_dest.upper()}**\n"
-                                f"📁 `{self.name}`\n"
-                                f"[{bar}] {percent:.1f}%\n"
-                                f"**Processed:** {get_readable_file_size(uploaded)} / {get_readable_file_size(total)}\n"
-                                f"**Speed:** {get_readable_file_size(speed)}/s")
+                        # Info khusus jika ini Transfer.it agar user tahu sedang enkripsi
+                        if self.up_dest == "transferit":
+                            text = (f"⬆️ **Mengupload ke TRANSFER.IT**\n"
+                                    f"📁 `{self.name}`\n"
+                                    f"⚡ Sedang memproses enkripsi & upload paralel...\n"
+                                    f"(Harap tunggu hingga link muncul)")
+                        else:
+                            text = (f"⬆️ **Mengupload ke {self.up_dest.upper()}**\n"
+                                    f"📁 `{self.name}`\n"
+                                    f"[{bar}] {percent:.1f}%\n"
+                                    f"**Processed:** {get_readable_file_size(uploaded)} / {get_readable_file_size(total)}\n"
+                                    f"**Speed:** {get_readable_file_size(speed)}/s")
                                 
                         if text != last_text:
                             try:
