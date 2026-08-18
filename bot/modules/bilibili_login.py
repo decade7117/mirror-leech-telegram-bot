@@ -155,7 +155,7 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
             r = await client.get("https://api.bilibili.tv/preupload", params={"name": filename, "size": filesize, "r": "upos", "profile": "iup/bup", "ssl": "0", "version": "2.10.0", "build": "2100000", "biz": "UGC"}, headers=base_headers)
             pre = r.json()
             if pre.get("OK") != 1: return False, f"Preupload error: {pre}"
-        except Exception as e: return False, f"Preupload error: {e}"
+        except Exception as e: return False, f"Preupload error: {str(e)[:50]}"
 
         upload_url = pre["endpoint"] + pre["upos_uri"].replace("upos://", "/")
         if upload_url.startswith("//"): upload_url = "https:" + upload_url
@@ -169,7 +169,7 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
                 upload_id = r.json().get("upload_id") or r.json().get("uploadId")
                 if upload_id: break
             except Exception as e:
-                if attempt == 3: return False, f"Init upload timeout: {e}"
+                if attempt == 3: return False, f"Init upload timeout: {str(e)[:50]}"
                 await asyncio.sleep(2)
 
         # 3. Chunks
@@ -218,8 +218,8 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
             try: res = r.json()
             except Exception: return False, f"API Error: HTTP {r.status_code}"
             
-            if res.get("code") == 0: return True, "Upload & Submit Berhasil! ✅"
-            return False, f"Submit gagal: {res}"
+            if res.get("code") == 0: return True, "Selesai"
+            return False, f"Submit gagal: {res.get('message', res)}"
         except Exception as e:
             return False, f"Submit Exception: {str(e)[:50]}"
 
@@ -239,7 +239,7 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
         last_text = ""
         start_time = time.time()
         while not shared_prog["done"]:
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
             if shared_prog["done"]: break
             
             elapsed = time.time() - start_time
@@ -282,7 +282,7 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
                         else:
                             text += f"⏳ {acc_name}: Memulai...\n"
                     else:
-                        text += f"⏱ {acc_name}: Menunggu antrean...\n"
+                        text += f"⏱️ {acc_name}: Menunggu antrean...\n"
             
             text += "\n<i>Ketik /cancelbili untuk batal</i>"
             
@@ -294,7 +294,16 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
 
     updater_task = asyncio.create_task(progress_updater())
     
-    video_path, err = await _download_video_async(url, user_id, shared_prog)
+    # GLOBAL TIMEOUT DOWNLOAD: Maksimal 60 menit!
+    try:
+        video_path, err = await asyncio.wait_for(
+            _download_video_async(url, user_id, shared_prog),
+            timeout=3600.0
+        )
+    except asyncio.TimeoutError:
+        video_path, err = None, "Download Terhenti (Timeout > 60 Menit)."
+    except Exception as e:
+        video_path, err = None, f"Error: {str(e)[:50]}"
     
     if not video_path: 
         shared_prog["done"] = True
@@ -317,15 +326,17 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
             shared_prog["up_progress"][acc["name"]]["uploaded"] = 0
             
             try:
+                # GLOBAL TIMEOUT UPLOAD (PEMBUNUH ZOMBIE UTAMA): Maksimal 20 menit per akun!
                 ok, detail = await asyncio.wait_for(
                     _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog),
-                    timeout=1800.0
+                    timeout=1200.0
                 )
+                
                 if ok:
                     shared_prog["up_progress"][acc["name"]]["state"] = "success"
                     return True, detail
                 else:
-                    # CEK FATAL ERROR: Langsung Skip kalau ketemu 412 atau 10004054!
+                    # CEK FATAL ERROR: Langsung Skip kalau error WAF / dilarang Bilibili
                     if "HTTP 412" in detail or "10004054" in detail:
                         shared_prog["up_progress"][acc["name"]]["state"] = "failed"
                         return False, detail
@@ -336,10 +347,12 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
                     
                     shared_prog["up_progress"][acc["name"]]["state"] = f"retrying {attempt}"
                     await asyncio.sleep(5)
+            
             except asyncio.TimeoutError:
+                # JIKA BENGONG MELEBIHI 20 MENIT, BUNUH DAN ULANGI!
                 if attempt == 3:
                     shared_prog["up_progress"][acc["name"]]["state"] = "failed"
-                    return False, "Upload Stuck/Timeout"
+                    return False, "Upload Macet Selamanya (Timeout > 20 Menit)"
                 shared_prog["up_progress"][acc["name"]]["state"] = f"retrying {attempt}"
                 await asyncio.sleep(5)
             except Exception as e:
