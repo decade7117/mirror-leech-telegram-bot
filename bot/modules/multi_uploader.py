@@ -366,54 +366,38 @@ def _upload_filemirage(path: str, key: str, user_id: int) -> str:
         return f"❌ Filemirage exception: {e}"
 
 
-# ── Upload: Transfer.it (E2EE API Murni - Mendukung Mode Anonim) ──────────────
+# ── Upload: Transfer.it (ASLI MENGGUNAKAN TRANSFERIT-PY) ──────────────
 async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Message) -> str:
     import os
-    import time
     import asyncio
+    import time
     from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
     if _CANCEL_TASKS.get(user_id): return "❌ Dibatalkan oleh pengguna."
     cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data=f"cancelmulti_{user_id}")]])
     
     filename = os.path.basename(path)
-    total_size = os.path.getsize(path)
     
-    shared_prog = {"uploaded": 0, "total": total_size, "done": False, "result": None}
+    shared_prog = {"done": False, "result": None}
 
-    def sync_upload_mega():
+    def sync_upload_transferit():
         try:
-            from mega import Mega
-            mega = Mega()
+            from transferit import Transferit
             
-            # Cek apakah menggunakan format Email:Password
-            if key and ":" in key:
-                email, password = key.split(":", 1)
-                m = mega.login(email, password)
-            else:
-                # Mode otomatis Anonim (Temporary Account)
-                m = mega.login() 
-            
-            # Proses enkripsi via Python (Makan CPU, Speed Terbatas)
-            file_node = m.upload(path)
-            raw_link = m.get_upload_link(file_node)
-            
-            # Manipulasi link
-            t_link = raw_link.replace("mega.nz/file/", "transfer.it/transfer/")
-            shared_prog['result'] = t_link
-            
+            # Transferit-py menggunakan WebSocket paralel,
+            # secara default ini meng-handle chunking + E2EE ke endpoint murni transfer.it
+            with Transferit() as tx:
+                result = tx.upload(path)
+                shared_prog['result'] = result.url
+                
         except ImportError:
-            shared_prog['result'] = "❌ Library 'mega.py' belum diinstall. Pastikan sudah ditambahkan ke requirements.txt dan VPS di-rebuild."
+            shared_prog['result'] = "❌ Library 'transferit-py' belum di-install di requirements.txt. Pastikan sudah di-build ulang."
         except Exception as e:
             shared_prog['result'] = f"❌ Transfer.it API Error: {e}"
         finally:
             shared_prog['done'] = True
 
     async def progress_updater():
-        start_time = time.time()
-        # Simulasi kecepatan rata-rata Python enkripsi AES (2.5 MB/s)
-        simulated_speed = 2500000 
-        
         while not shared_prog['done']:
             await asyncio.sleep(3)
             if shared_prog['done']: break
@@ -423,26 +407,15 @@ async def _upload_transferit(path: str, key: str, user_id: int, status_msg: Mess
                 shared_prog['result'] = "❌ Dibatalkan oleh pengguna."
                 break
             
-            shared_prog['uploaded'] += (simulated_speed * 3)
-            if shared_prog['uploaded'] >= shared_prog['total']:
-                shared_prog['uploaded'] = shared_prog['total'] - 1024
-                
-            uploaded = shared_prog['uploaded']
-            total = shared_prog['total']
-            percent = (uploaded / total) * 100 if total > 0 else 0
-            
-            bar = "█" * int(15 * percent / 100) + "▒" * (15 - int(15 * percent / 100))
-            mode_text = "(Akun Pribadi)" if key and ":" in key else "(Mode Anonim)"
-            text = (f"⬆️ **Mengupload ke TRANSFER.IT {mode_text}**\n"
+            text = (f"⬆️ **Mengupload ke TRANSFER.IT**\n"
                     f"📁 `{filename}`\n"
-                    f"[{bar}] {percent:.1f}%\n"
-                    f"**Processed:** {_sizeof_fmt(uploaded)} / {_sizeof_fmt(total)}\n"
-                    f"**Speed:** ~2.5 MB/s (CPU Encrypting...)")
+                    f"⚡ Sedang memproses enkripsi & upload paralel...\n"
+                    f"(Library `transferit-py` sedang bekerja, harap tunggu hingga link muncul)")
             try: await status_msg.edit(text, reply_markup=cancel_btn)
             except: pass
 
     updater_task = asyncio.create_task(progress_updater())
-    await asyncio.to_thread(sync_upload_mega)
+    await asyncio.to_thread(sync_upload_transferit)
     await updater_task
     
     return shared_prog['result'] or "❌ Gagal mengunggah ke Transfer.it."
