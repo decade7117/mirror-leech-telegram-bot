@@ -46,7 +46,7 @@ DEFAULT_SETTINGS = {
     "title_prefix": "",
     "desc": "",
     "copyright": 1,
-    "account_mode": "round_robin", 
+    "account_mode": "all", 
 }
 
 def load_settings() -> dict:
@@ -101,7 +101,8 @@ async def _download_video_async(url: str, user_id: int, shared_prog: dict) -> tu
         tmp_path = f"/tmp/{filename}"
         
         shared_prog["status"] = "Downloading"
-        limits = httpx.Timeout(60.0, connect=30.0)
+        
+        limits = httpx.Timeout(None, connect=30.0, read=60.0, write=60.0)
         
         async with httpx.AsyncClient(follow_redirects=True, timeout=limits) as client:
             async with client.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
@@ -118,11 +119,13 @@ async def _download_video_async(url: str, user_id: int, shared_prog: dict) -> tu
                         shared_prog["dl_downloaded"] += len(chunk)
                         
                 if total_size > 0 and shared_prog["dl_downloaded"] < total_size:
-                    raise Exception(f"Download terputus sebelum selesai (Hanya dpt {shared_prog['dl_downloaded']} dari {total_size} bytes). Koneksi/VPN mungkin mati.")
+                    raise Exception(f"Download terputus (Dapat {shared_prog['dl_downloaded']}/{total_size}).")
                     
         return tmp_path, None
+    except httpx.ReadTimeout:
+        return None, "Download macet (Cloudflare Throttle). Batal otomatis karena speed lambat."
     except Exception as e:
-        return None, str(e)
+        return None, f"Error Download: {str(e)[:100]}"
 
 async def _do_upload_playwright(video_path: str, account: dict, title: str, tags: str, desc: str, custom_cover: str, user_id: int, shared_prog: dict) -> tuple[bool, str]:
     try:
@@ -143,7 +146,8 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
 
     CHUNK_SIZE = 10 * 1024 * 1024
     acc_name = account['name']
-    limits = httpx.Timeout(120.0, connect=30.0)
+    
+    limits = httpx.Timeout(None, connect=30.0, read=60.0, write=60.0)
 
     async with httpx.AsyncClient(timeout=limits, follow_redirects=True) as client:
         # 1. Preupload
@@ -181,21 +185,26 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
                 
                 for attempt in range(5):
                     try:
-                        r = await client.put(upload_url, params={"partNumber": chunk_idx+1, "uploadId": upload_id, "chunk": chunk_idx, "chunks": total_chunks, "size": end-start, "start": start, "end": end, "total": filesize}, content=chunk_data, headers=upos_headers, timeout=120)
+                        r = await client.put(upload_url, params={"partNumber": chunk_idx+1, "uploadId": upload_id, "chunk": chunk_idx, "chunks": total_chunks, "size": end-start, "start": start, "end": end, "total": filesize}, content=chunk_data, headers=upos_headers)
                         if r.status_code in (200, 204): 
                             shared_prog["up_progress"][acc_name]["uploaded"] += len(chunk_data)
                             break
+                    except httpx.WriteTimeout:
+                        if attempt == 4: return False, "Upload macet (Koneksi Putus)"
+                        await asyncio.sleep(4)
                     except Exception as e:
-                        if attempt == 4: return False, f"Gagal upload chunk {chunk_idx+1}: {e}"
+                        if attempt == 4: return False, f"Gagal upload: {str(e)[:50]}"
                         await asyncio.sleep(4)
                 
                 parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
 
+        shared_prog["up_progress"][acc_name]["state"] = "submitting"
+
         # 4. Complete
         try:
-            r = await client.post(upload_url, params={"output": "json", "name": filename, "profile": "iup/bup", "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")), "biz": "UGC"}, json={"parts": parts}, headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"}, timeout=60)
+            r = await client.post(upload_url, params={"output": "json", "name": filename, "profile": "iup/bup", "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")), "biz": "UGC"}, json={"parts": parts}, headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"})
             complete_data = r.json()
-        except Exception as e: return False, f"Complete error: {e}"
+        except Exception as e: return False, f"Complete error: {str(e)[:50]}"
 
         # 5. Submit
         video_key = complete_data.get("key", "").strip("/")
@@ -205,13 +214,14 @@ async def _do_upload_playwright(video_path: str, account: dict, title: str, tags
         submit_data = {"title": title[:80], "cover": final_cover, "desc": desc, "no_reprint": True, "filename": filename_only, "playlist_id": "", "visibility": 0, "subtitle_id": None, "subtitle_lang_id": None, "from_spmid": "333.1011", "copyright": 1, "tag": tags or "anime"}
 
         try:
-            r = await client.post("https://api.bilibili.tv/intl/videoup/web2/add", params=submit_params, json=submit_data, headers={**base_headers, "Content-Type": "application/json"}, timeout=60)
+            r = await client.post("https://api.bilibili.tv/intl/videoup/web2/add", params=submit_params, json=submit_data, headers={**base_headers, "Content-Type": "application/json"})
             try: res = r.json()
             except Exception: return False, f"API Error: HTTP {r.status_code}"
+            
             if res.get("code") == 0: return True, "Upload & Submit Berhasil! ✅"
             return False, f"Submit gagal: {res}"
         except Exception as e:
-            return False, f"Submit Exception: {e}"
+            return False, f"Submit Exception: {str(e)[:50]}"
 
 async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_cover, target_accounts, user_id, mode):
     shared_prog = {
@@ -222,11 +232,14 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
         "up_progress": {}
     }
 
+    for acc in target_accounts:
+        shared_prog["up_progress"][acc["name"]] = {"uploaded": 0, "total": 0, "state": "waiting"}
+
     async def progress_updater():
         last_text = ""
         start_time = time.time()
         while not shared_prog["done"]:
-            await asyncio.sleep(4)
+            await asyncio.sleep(3)
             if shared_prog["done"]: break
             
             elapsed = time.time() - start_time
@@ -243,17 +256,31 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
                 text += f"Speed: {_sizeof_fmt(speed)}/s"
                 
             elif shared_prog["status"] == "Uploading":
+                success_count = sum(1 for p in shared_prog["up_progress"].values() if p["state"] == "success")
+                total_accs = len(target_accounts)
+                
                 if mode in ("queue_oneall", "batch_5"):
-                    text += f"🚀 **Upload Paralel (Maks 4 Bersamaan):**\n"
+                    text += f"🚀 **Upload Paralel ({success_count}/{total_accs} Selesai):**\n"
                 else:
-                    text += f"🚀 **Upload Sekuensial:**\n"
+                    text += f"🚀 **Upload Sekuensial ({success_count}/{total_accs} Selesai):**\n"
                     
                 for acc_name, prog in shared_prog["up_progress"].items():
+                    state = prog["state"]
                     pct = (prog["uploaded"] / prog["total"]) * 100 if prog["total"] > 0 else 0
-                    if pct == 100:
+                    
+                    if state == "success":
                         text += f"✅ {acc_name}: Selesai\n"
-                    elif pct > 0:
-                        text += f"⏳ {acc_name}: {pct:.1f}%\n"
+                    elif state == "failed":
+                        text += f"❌ {acc_name}: Gagal\n"
+                    elif state == "submitting":
+                        text += f"🔄 {acc_name}: Sedang Submit...\n"
+                    elif state.startswith("retrying"):
+                        text += f"⚠️ {acc_name}: Mengulang...\n"
+                    elif state == "uploading":
+                        if pct > 0:
+                            text += f"⏳ {acc_name}: {pct:.1f}%\n"
+                        else:
+                            text += f"⏳ {acc_name}: Memulai...\n"
                     else:
                         text += f"⏱ {acc_name}: Menunggu antrean...\n"
             
@@ -278,45 +305,75 @@ async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_
     results = []
     failed_accounts = []
     
+    async def process_account_with_retry(acc):
+        shared_prog["up_progress"][acc["name"]]["total"] = os.path.getsize(video_path)
+        
+        for attempt in range(1, 4):
+            if _CANCEL_BILI.get(user_id):
+                shared_prog["up_progress"][acc["name"]]["state"] = "failed"
+                return False, "🛑 Upload dibatalkan manual."
+
+            shared_prog["up_progress"][acc["name"]]["state"] = "uploading"
+            shared_prog["up_progress"][acc["name"]]["uploaded"] = 0
+            
+            try:
+                ok, detail = await asyncio.wait_for(
+                    _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog),
+                    timeout=1800.0
+                )
+                if ok:
+                    shared_prog["up_progress"][acc["name"]]["state"] = "success"
+                    return True, detail
+                else:
+                    # CEK FATAL ERROR: Langsung Skip kalau ketemu 412 atau 10004054!
+                    if "HTTP 412" in detail or "10004054" in detail:
+                        shared_prog["up_progress"][acc["name"]]["state"] = "failed"
+                        return False, detail
+                        
+                    if attempt == 3:
+                        shared_prog["up_progress"][acc["name"]]["state"] = "failed"
+                        return False, detail
+                    
+                    shared_prog["up_progress"][acc["name"]]["state"] = f"retrying {attempt}"
+                    await asyncio.sleep(5)
+            except asyncio.TimeoutError:
+                if attempt == 3:
+                    shared_prog["up_progress"][acc["name"]]["state"] = "failed"
+                    return False, "Upload Stuck/Timeout"
+                shared_prog["up_progress"][acc["name"]]["state"] = f"retrying {attempt}"
+                await asyncio.sleep(5)
+            except Exception as e:
+                if attempt == 3:
+                    shared_prog["up_progress"][acc["name"]]["state"] = "failed"
+                    return False, f"Error: {str(e)[:40]}"
+                shared_prog["up_progress"][acc["name"]]["state"] = f"retrying {attempt}"
+                await asyncio.sleep(5)
+
     try:
         if mode in ("queue_oneall", "batch_5"):
-            # LAMPU MERAH: Maksimal 4 akun berbarengan agar tidak kena Error 412 Bilibili WAF
             sem = asyncio.Semaphore(4)
-            
             async def safe_upload(acc):
                 async with sem:
-                    return await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog)
+                    return await process_account_with_retry(acc)
             
-            tasks = []
-            for acc in target_accounts:
-                shared_prog["up_progress"][acc["name"]] = {"uploaded": 0, "total": os.path.getsize(video_path)}
-                tasks.append(safe_upload(acc))
-            
+            tasks = [safe_upload(acc) for acc in target_accounts]
             res_list = await asyncio.gather(*tasks, return_exceptions=True)
             
             for acc, res in zip(target_accounts, res_list):
                 if isinstance(res, Exception):
                     failed_accounts.append(acc)
-                    results.append(f"❌ <b>{acc['name']}</b>: Exception {res}")
+                    results.append(f"❌ <b>{acc['name']}</b>: Exception {str(res)[:50]}")
                 else:
                     ok, detail = res
                     emoji = "✅" if ok else "❌"
                     results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
                     if not ok: failed_accounts.append(acc)
         else:
-            for i, acc in enumerate(target_accounts):
-                if _CANCEL_BILI.get(user_id):
-                    results.append("🛑 Upload dibatalkan manual.")
-                    break
-                
-                shared_prog["up_progress"][acc["name"]] = {"uploaded": 0, "total": os.path.getsize(video_path)}
-                ok, detail = await _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog)
-                
+            for acc in target_accounts:
+                ok, detail = await process_account_with_retry(acc)
                 emoji = "✅" if ok else "❌"
                 results.append(f"{emoji} <b>{acc['name']}</b>: {detail}")
-                
                 if not ok: failed_accounts.append(acc)
-                if i < len(target_accounts) - 1: await asyncio.sleep(2)
                 
     finally:
         shared_prog["done"] = True
@@ -381,7 +438,7 @@ async def bili_accounts_cmd(client, message: Message):
     for i, acc in enumerate(accounts, 1):
         lines.append(f"{i}. {'✅' if acc['valid'] else '⚠️'} <b>{acc['name']}</b>")
     lines.append(f"\n🏷 Tags: {', '.join(f'#{t}' for t in settings.get('tags', [])) or '-'}")
-    lines.append(f"🔄 Mode: <b>{settings.get('account_mode', 'round_robin')}</b>")
+    lines.append(f"🔄 Mode: <b>{settings.get('account_mode', 'all')}</b>")
     await message.reply("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Login Baru", callback_data="bili_new_login"), InlineKeyboardButton("⚙️ Set", callback_data="bili_settings")]]))
 
 @new_task
@@ -401,7 +458,7 @@ async def bili_set_cmd(client, message: Message):
     text = message.text or message.caption or ""
     args = text.split(maxsplit=2)
     settings = load_settings()
-    if len(args) < 3: return await message.reply("Cara pakai:\n/biliset mode batch_5\n/biliset mode queue_oneall\n/biliset tags anime")
+    if len(args) < 3: return await message.reply("Cara pakai:\n/biliset mode all\n/biliset mode queue_oneall\n/biliset tags anime")
     key, val = args[1].lower(), args[2].strip()
     
     if key == "tags":
@@ -452,7 +509,7 @@ async def bili_upload_cmd(client, message: Message):
     desc = custom_desc or settings.get("desc", "")
     tags_str = ",".join(settings.get("tags", []))
     
-    mode = settings.get("account_mode", "round_robin")
+    mode = settings.get("account_mode", "all")
     if mode in ("all", "queue_oneall"): 
         target_accounts = accounts
     elif mode == "batch_5":
