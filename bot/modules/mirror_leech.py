@@ -343,6 +343,7 @@ class Mirror(TaskListener):
 
         # ==========================================
         # SUNTIKAN UI TOMBOL (PIKABOT STYLE)
+        # DENGAN TAMBAHAN TRANSFER.IT
         # ==========================================
         if not args["-up"] and not self.is_leech: 
             buttons = InlineKeyboardMarkup([
@@ -356,8 +357,11 @@ class Mirror(TaskListener):
                 ],
                 [
                     InlineKeyboardButton("Pixeldrain", callback_data=f"updest_{self.message.id}_pixeldrain"),
-                    InlineKeyboardButton("Filemirage", callback_data=f"updest_{self.message.id}_filemirage"),
-                    InlineKeyboardButton("Player4me", callback_data=f"updest_{self.message.id}_player4me")
+                    InlineKeyboardButton("Filemirage", callback_data=f"updest_{self.message.id}_filemirage")
+                ],
+                [
+                    InlineKeyboardButton("Player4me", callback_data=f"updest_{self.message.id}_player4me"),
+                    InlineKeyboardButton("Transfer.it", callback_data=f"updest_{self.message.id}_transferit")
                 ]
             ])
 
