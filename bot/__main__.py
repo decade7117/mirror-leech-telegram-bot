@@ -35,7 +35,6 @@ async def main():
     from .helper.ext_utils.telegraph_helper import telegraph
     from .helper.mirror_leech_utils.rclone_utils.serve import rclone_serve_booter
     from .modules import (
-        initiate_search_tools,
         get_packages_version,
         restart_notification,
     )
@@ -44,7 +43,6 @@ async def main():
         save_settings(),
         jdownloader.boot(),
         clean_all(),
-        initiate_search_tools(),
         get_packages_version(),
         restart_notification(),
         telegraph.create_account(),
@@ -62,5 +60,5 @@ add_aria2_callbacks()
 create_help_buttons()
 add_handlers()
 
-LOGGER.info("Bot Started!")
+LOGGER.info("Bot Bilibili Khusus Started!")
 bot_loop.run_forever()
