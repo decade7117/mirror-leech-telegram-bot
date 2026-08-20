@@ -43,7 +43,8 @@ DL_DIR = Path("/app/downloads")
 DL_DIR.mkdir(parents=True, exist_ok=True)
 
 BILI_SETTINGS_FILE = BILI_DIR / "settings.json"
-RETRY_DB_FILE = BILI_DIR / "retry_tasks.json"
+# FILE INI YANG BIKIN RETRY TAHAN BANTING WALAU VPS RESTART!
+RETRY_DB_FILE = BILI_DIR / "retry_tasks.json" 
 
 DEFAULT_SETTINGS = {
     "tags": ["anime", "indonesia"],
@@ -75,7 +76,7 @@ def _cleanup(*paths):
     """Hapus file temp di SSD dan paksa release RAM."""
     for p in paths:
         try:
-            if p and os.path.exists(p):
+            if p and p != "SKIP_DOWNLOAD" and os.path.exists(p):
                 os.unlink(p)
         except Exception:
             pass
@@ -85,6 +86,7 @@ _login_sessions: dict = {}
 _CANCEL_BILI: dict = {}
 _RETRY_TASKS: dict = load_retry_tasks()
 bili_upload_lock = asyncio.Lock()
+bili_submit_lock = asyncio.Lock() # 🐀 GEMBOK JALAN TIKUS
 
 def list_accounts() -> list[dict]:
     accounts = []
@@ -166,129 +168,100 @@ async def _do_upload_playwright(
         return False, f"Error cookie: {e}"
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    filename = Path(video_path).name
-    filesize = os.path.getsize(video_path)
-
+    
     base_headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/143.0.0.0 Mobile Safari/537.36",
         "Origin": "https://studio.bilibili.tv",
         "Referer": "https://studio.bilibili.tv/",
         "Cookie": cookie_header,
     }
-
-    CHUNK_SIZE = 10 * 1024 * 1024
+    
     acc_name = account["name"]
-
     limits = httpx.Timeout(90.0, connect=30.0, read=90.0, write=90.0)
 
+    # 💡 IDE CLAUDE: CEK APAKAH INI RETRY SUBMIT-ONLY?
+    pending_filename = account.get("pending_filename")
+    
     async with httpx.AsyncClient(timeout=limits, follow_redirects=True) as client:
-        try:
-            r = await asyncio.wait_for(
-                client.get(
-                    "https://api.bilibili.tv/preupload",
-                    params={"name": filename, "size": filesize, "r": "upos",
-                            "profile": "iup/bup", "ssl": "0", "version": "2.10.0",
-                            "build": "2100000", "biz": "UGC"},
-                    headers=base_headers
-                ),
-                timeout=30.0
-            )
-            pre = r.json()
-            if pre.get("OK") != 1:
-                return False, f"Preupload error: {pre}"
-        except Exception as e:
-            return False, f"Preupload error: {str(e)[:50]}"
+        if pending_filename:
+            # JIKA RETRY, LANGSUNG LOMPAT KE TAHAP SUBMIT (TIDAK UPLOAD CHUNK LAGI!)
+            filename_only = pending_filename
+            shared_prog["up_progress"][acc_name]["uploaded"] = shared_prog["up_progress"][acc_name]["total"]
+            shared_prog["up_progress"][acc_name]["state"] = "Menyiapkan Submit Ulang..."
+        else:
+            # JIKA BARU, LAKUKAN UPLOAD CHUNK SEPERTI BIASA
+            filename = Path(video_path).name
+            filesize = os.path.getsize(video_path)
+            CHUNK_SIZE = 10 * 1024 * 1024
 
-        upload_url = pre["endpoint"] + pre["upos_uri"].replace("upos://", "/")
-        if upload_url.startswith("//"): upload_url = "https:" + upload_url
-        upos_headers = {**base_headers, "X-Upos-Auth": pre["auth"], "Content-Type": "application/octet-stream"}
-
-        upload_id = None
-        for attempt in range(1, 4):
             try:
                 r = await asyncio.wait_for(
-                    client.post(
-                        upload_url,
-                        params={"uploads": "", "output": "json"},
-                        headers={**upos_headers, "Content-Type": "application/json"},
-                        content=b""
-                    ),
-                    timeout=30.0
-                )
-                upload_id = r.json().get("upload_id") or r.json().get("uploadId")
-                if upload_id: break
-            except Exception as e:
-                if attempt == 3: return False, f"Init upload gagal: {str(e)[:50]}"
-                await asyncio.sleep(2)
+                    client.get("https://api.bilibili.tv/preupload",
+                        params={"name": filename, "size": filesize, "r": "upos", "profile": "iup/bup", "ssl": "0", "version": "2.10.0", "build": "2100000", "biz": "UGC"},
+                        headers=base_headers), timeout=30.0)
+                pre = r.json()
+                if pre.get("OK") != 1: return False, f"Preupload error: {pre}"
+            except Exception as e: return False, f"Preupload error: {str(e)[:50]}"
 
-        total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
-        parts = []
+            upload_url = pre["endpoint"] + pre["upos_uri"].replace("upos://", "/")
+            if upload_url.startswith("//"): upload_url = "https:" + upload_url
+            upos_headers = {**base_headers, "X-Upos-Auth": pre["auth"], "Content-Type": "application/octet-stream"}
+
+            upload_id = None
+            for attempt in range(1, 4):
+                try:
+                    r = await asyncio.wait_for(
+                        client.post(upload_url, params={"uploads": "", "output": "json"}, headers={**upos_headers, "Content-Type": "application/json"}, content=b""), timeout=30.0)
+                    upload_id = r.json().get("upload_id") or r.json().get("uploadId")
+                    if upload_id: break
+                except Exception as e:
+                    if attempt == 3: return False, f"Init upload gagal: {str(e)[:50]}"
+                    await asyncio.sleep(2)
+
+            total_chunks = (filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
+            parts = []
+            
+            async with aiofiles.open(video_path, "rb") as f:
+                for chunk_idx in range(total_chunks):
+                    if _CANCEL_BILI.get(user_id): return False, "Upload dibatalkan."
+                    start = chunk_idx * CHUNK_SIZE
+                    end = min((chunk_idx + 1) * CHUNK_SIZE, filesize)
+                    await f.seek(start)
+                    chunk_data = await f.read(end - start)
+
+                    for attempt in range(5):
+                        try:
+                            r = await asyncio.wait_for(
+                                client.put(upload_url, params={"partNumber": chunk_idx + 1, "uploadId": upload_id, "chunk": chunk_idx, "chunks": total_chunks, "size": end - start, "start": start, "end": end, "total": filesize}, content=chunk_data, headers=upos_headers), timeout=90.0)
+                            if r.status_code in (200, 204):
+                                shared_prog["up_progress"][acc_name]["uploaded"] += len(chunk_data)
+                                break
+                            if attempt == 4: return False, f"Chunk gagal (HTTP {r.status_code})"
+                        except asyncio.TimeoutError:
+                            if attempt == 4: return False, "Chunk timeout 90s — koneksi zombie diputus"
+                            await asyncio.sleep(4)
+                        except Exception as e:
+                            if attempt == 4: return False, f"Chunk error: {str(e)[:50]}"
+                            await asyncio.sleep(4)
+
+                    parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
+                    
+                    del chunk_data
+                    if chunk_idx % 10 == 0: gc.collect()
+
+            try:
+                r = await asyncio.wait_for(
+                    client.post(upload_url, params={"output": "json", "name": filename, "profile": "iup/bup", "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")), "biz": "UGC"}, json={"parts": parts}, headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"}), timeout=60.0)
+                complete_data = r.json()
+            except Exception as e: return False, f"Complete error: {str(e)[:50]}"
+
+            video_key = complete_data.get("key", "").strip("/")
+            filename_only = video_key.replace(".mp4", "")
+
+        # -------------------------------------------------------------
+        # TAHAP 5: SUBMIT KE SERVER BOS DENGAN JALAN TIKUS!
+        # -------------------------------------------------------------
         
-        async with aiofiles.open(video_path, "rb") as f:
-            for chunk_idx in range(total_chunks):
-                if _CANCEL_BILI.get(user_id):
-                    return False, "Upload dibatalkan."
-
-                start = chunk_idx * CHUNK_SIZE
-                end = min((chunk_idx + 1) * CHUNK_SIZE, filesize)
-                await f.seek(start)
-                chunk_data = await f.read(end - start)
-
-                for attempt in range(5):
-                    try:
-                        r = await asyncio.wait_for(
-                            client.put(
-                                upload_url,
-                                params={"partNumber": chunk_idx + 1, "uploadId": upload_id,
-                                        "chunk": chunk_idx, "chunks": total_chunks,
-                                        "size": end - start, "start": start,
-                                        "end": end, "total": filesize},
-                                content=chunk_data,
-                                headers=upos_headers
-                            ),
-                            timeout=90.0
-                        )
-                        if r.status_code in (200, 204):
-                            shared_prog["up_progress"][acc_name]["uploaded"] += len(chunk_data)
-                            break
-                        if attempt == 4:
-                            return False, f"Chunk gagal (HTTP {r.status_code})"
-                    except asyncio.TimeoutError:
-                        if attempt == 4:
-                            return False, "Chunk timeout 90s — koneksi zombie diputus"
-                        await asyncio.sleep(4)
-                    except Exception as e:
-                        if attempt == 4:
-                            return False, f"Chunk error: {str(e)[:50]}"
-                        await asyncio.sleep(4)
-
-                parts.append({"partNumber": chunk_idx + 1, "eTag": "etag"})
-                
-                # Bebaskan RAM per 10 chunk (100MB) biar CPU dan RAM adem!
-                del chunk_data
-                if chunk_idx % 10 == 0:
-                    gc.collect()
-
-        shared_prog["up_progress"][acc_name]["state"] = "submitting"
-
-        try:
-            r = await asyncio.wait_for(
-                client.post(
-                    upload_url,
-                    params={"output": "json", "name": filename, "profile": "iup/bup",
-                            "uploadId": upload_id, "biz_id": str(pre.get("biz_id", "")),
-                            "biz": "UGC"},
-                    json={"parts": parts},
-                    headers={**upos_headers, "Content-Type": "application/json; charset=UTF-8"}
-                ),
-                timeout=60.0
-            )
-            complete_data = r.json()
-        except Exception as e:
-            return False, f"Complete error: {str(e)[:50]}"
-
-        video_key = complete_data.get("key", "").strip("/")
-        filename_only = video_key.replace(".mp4", "")
         submit_params = {
             "lang_id": "3", "platform": "web", "lang": "en_US",
             "s_locale": "en_US", "timezone": "GMT+07:00",
@@ -302,36 +275,44 @@ async def _do_upload_playwright(
             "from_spmid": "333.1011", "copyright": 1, "tag": tags or "anime"
         }
 
-        try:
-            r = await asyncio.wait_for(
-                client.post(
-                    "https://api.bilibili.tv/intl/videoup/web2/add",
-                    params=submit_params, json=submit_data,
-                    headers={**base_headers, "Content-Type": "application/json"}
-                ),
-                timeout=60.0
-            )
+        # 🐀 JALAN TIKUS: ANTREAN SEBELUM SUBMIT (20 - 60 DETIK)
+        async with bili_submit_lock:
+            waktu_jeda = random.randint(20, 60)
+            shared_prog["up_progress"][acc_name]["state"] = f"sleeping {waktu_jeda}s..."
+            await asyncio.sleep(waktu_jeda)
+            
+            shared_prog["up_progress"][acc_name]["state"] = "submitting"
+
             try:
-                res = r.json()
-            except Exception:
-                return False, f"API Error: HTTP {r.status_code}"
+                r = await asyncio.wait_for(
+                    client.post("https://api.bilibili.tv/intl/videoup/web2/add", params=submit_params, json=submit_data, headers={**base_headers, "Content-Type": "application/json"}), timeout=60.0)
+                try:
+                    res = r.json()
+                except Exception:
+                    # 💡 TANGKAP ERROR 412: KEMBALIKAN KODE KHUSUS!
+                    return False, f"SUBMIT_FAIL|{filename_only}|API Error: HTTP {r.status_code}"
 
-            if res.get("code") == 0:
-                return True, "Selesai ✅"
-            return False, f"Submit gagal: {res.get('message', res)}"
-        except asyncio.TimeoutError:
-            return False, "Submit timeout 60s"
-        except Exception as e:
-            return False, f"Submit error: {str(e)[:50]}"
+                if res.get("code") == 0: return True, "Selesai ✅"
+                return False, f"SUBMIT_FAIL|{filename_only}|Submit ditolak: {res.get('message', res)}"
+            
+            except asyncio.TimeoutError:
+                return False, f"SUBMIT_FAIL|{filename_only}|Submit timeout 60s"
+            except Exception as e:
+                # 💡 TANGKAP WAF 412/4054: KEMBALIKAN KODE KHUSUS
+                if "412" in str(e) or "4054" in str(e):
+                    return False, f"SUBMIT_FAIL|{filename_only}|Limit Submit WAF (HTTP 412)"
+                return False, f"SUBMIT_FAIL|{filename_only}|Submit error: {str(e)[:50]}"
 
-async def _core_bili_upload_loop(
-    status_msg, url, title, desc, tags_str, custom_cover,
-    target_accounts, user_id, mode
-):
+
+async def _core_bili_upload_loop(status_msg, url, title, desc, tags_str, custom_cover, target_accounts, user_id, mode):
     shared_prog = {
         "done": False, "status": "Starting",
         "dl_total": 0, "dl_downloaded": 0, "up_progress": {}
     }
+    
+    # 💡 CEK APAKAH SEMUA AKUN ADALAH MODE RETRY SUBMIT-ONLY?
+    semua_cuma_retry = all(acc.get("pending_filename") for acc in target_accounts)
+
     for acc in target_accounts:
         shared_prog["up_progress"][acc["name"]] = {"uploaded": 0, "total": 0, "state": "waiting"}
 
@@ -366,7 +347,9 @@ async def _core_bili_upload_loop(
                     pct = (prog["uploaded"] / prog["total"]) * 100 if prog["total"] > 0 else 0
                     if state == "success": text += f"✅ {acc_name}: Selesai\n"
                     elif state == "failed": text += f"❌ {acc_name}: Gagal\n"
+                    elif state.startswith("sleeping"): text += f"💤 {acc_name}: {state}\n"
                     elif state == "submitting": text += f"🔄 {acc_name}: Submit...\n"
+                    elif state == "Menyiapkan Submit Ulang...": text += f"♻️ {acc_name}: {state}\n"
                     elif state.startswith("retrying"): text += f"⚠️ {acc_name}: Retry...\n"
                     elif state == "uploading":
                         text += f"⏳ {acc_name}: {pct:.1f}%\n" if pct > 0 else f"⏳ {acc_name}: Memulai...\n"
@@ -383,50 +366,53 @@ async def _core_bili_upload_loop(
     video_path = None
 
     try:
-        try:
-            video_path, err = await asyncio.wait_for(
-                _download_video_async(url, user_id, shared_prog),
-                timeout=3600.0
-            )
-        except asyncio.TimeoutError:
-            video_path, err = None, "Download timeout > 60 menit."
-        except Exception as e:
-            video_path, err = None, f"Error: {str(e)[:50]}"
+        # JIKA SEMUA CUMA RETRY SUBMIT, LOMPATI PROSES DOWNLOAD!
+        if semua_cuma_retry:
+            video_path = "SKIP_DOWNLOAD"
+            shared_prog["status"] = "Uploading"
+        else:
+            try:
+                video_path, err = await asyncio.wait_for(_download_video_async(url, user_id, shared_prog), timeout=3600.0)
+            except asyncio.TimeoutError:
+                video_path, err = None, "Download timeout > 60 menit."
+            except Exception as e:
+                video_path, err = None, f"Error: {str(e)[:50]}"
 
-        if not video_path:
-            return None, target_accounts, err
+            if not video_path:
+                return None, target_accounts, err
 
-        shared_prog["status"] = "Uploading"
+            shared_prog["status"] = "Uploading"
+            
         results = []
         failed_accounts = []
 
         async def process_account_with_retry(acc):
-            shared_prog["up_progress"][acc["name"]]["total"] = os.path.getsize(video_path)
+            if not acc.get("pending_filename"):
+                shared_prog["up_progress"][acc["name"]]["total"] = os.path.getsize(video_path)
 
             for attempt in range(1, 4):
                 if _CANCEL_BILI.get(user_id):
                     shared_prog["up_progress"][acc["name"]]["state"] = "failed"
                     return False, "🛑 Dibatalkan manual."
 
-                shared_prog["up_progress"][acc["name"]]["state"] = "uploading"
-                shared_prog["up_progress"][acc["name"]]["uploaded"] = 0
+                if not acc.get("pending_filename"):
+                    shared_prog["up_progress"][acc["name"]]["state"] = "uploading"
+                    shared_prog["up_progress"][acc["name"]]["uploaded"] = 0
 
                 try:
                     ok, detail = await asyncio.wait_for(
-                        _do_upload_playwright(
-                            video_path, acc, title, tags_str,
-                            desc, custom_cover, user_id, shared_prog
-                        ),
-                        timeout=1200.0
-                    )
+                        _do_upload_playwright(video_path, acc, title, tags_str, desc, custom_cover, user_id, shared_prog), timeout=1200.0)
 
                     if ok:
                         shared_prog["up_progress"][acc["name"]]["state"] = "success"
                         return True, detail
 
-                    if "HTTP 412" in detail or "10004054" in detail:
+                    # 💡 JIKA KENA ERROR SUBMIT (412 DLL), CATAT FILENAME-NYA BIAR RETRY GAK DOWNLOAD ULANG!
+                    if isinstance(detail, str) and detail.startswith("SUBMIT_FAIL|"):
+                        _, saved_fname, real_error = detail.split("|", 2)
+                        acc["pending_filename"] = saved_fname
                         shared_prog["up_progress"][acc["name"]]["state"] = "failed"
-                        return False, detail
+                        return False, real_error # Jangan di-retry otomatis, biarkan user klik Retry
 
                     if attempt == 3:
                         shared_prog["up_progress"][acc["name"]]["state"] = "failed"
