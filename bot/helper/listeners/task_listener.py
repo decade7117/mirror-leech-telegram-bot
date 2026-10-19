@@ -303,11 +303,22 @@ class TaskListener(TaskConfig):
             del tg
 
         # ==========================================
-        # SUNTIKAN MESIN CUSTOM UPLOAD DENGAN LIVE PROGRESS BAR & ANTI-HANTU
+        # CUSTOM UPLOAD: FILES + TRANSFER.IT FOLDERS
+        # Transfer.it accepts folders directly. For the other custom
+        # hosts below, folder uploads are zipped to a temporary directory.
+        # Single files are never zipped.
         # ==========================================
-        # DITAMBAHKAN "transferit" DI SINI
-        elif getattr(self, 'up_dest', '') in ["gofile", "buzzheavier", "pixeldrain", "filemirage", "player4me", "transferit"]:
-            LOGGER.info(f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}")
+        elif getattr(self, "up_dest", "") in [
+            "gofile",
+            "buzzheavier",
+            "pixeldrain",
+            "filemirage",
+            "player4me",
+            "transferit",
+        ]:
+            LOGGER.info(
+                f"Custom Upload Name: {self.name} ke {self.up_dest.upper()}"
+            )
             import requests
             import os
             import time
@@ -315,191 +326,346 @@ class TaskListener(TaskConfig):
             import urllib.parse
             import math
             import base64
-            
+            import shutil
+            import tempfile
+
             try:
                 from bot.modules.multi_uploader import _API_KEYS
             except ImportError:
                 _API_KEYS = {}
-                
+
             api_key = _API_KEYS.get(self.up_dest, "")
-            
+
             async with task_dict_lock:
                 if self.mid in task_dict:
                     del task_dict[self.mid]
                 tasks_count = len(task_dict)
-            
-            if tasks_count == 0: await self.clean() 
-            else: await update_status_message(self.message.chat.id)
-            
+
+            if tasks_count == 0:
+                await self.clean()
+            else:
+                await update_status_message(self.message.chat.id)
+
             target_path = os.path.join(self.dir, self.name)
-            
-            if os.path.isfile(target_path):
-                ui_msg = await send_message(self.message, f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n📁 `{self.name}`\nMenyiapkan koneksi...")
-                
-                shared_prog = {"uploaded": 0, "total": os.path.getsize(target_path), "done": False, "link": None, "error": None}
-                
+            archive_temp_dir = None
+            is_transferit_folder = (
+                self.up_dest == "transferit" and os.path.isdir(target_path)
+            )
+
+            # Folder upload: Transfer.it directly, other supported hosts via ZIP.
+            if os.path.isdir(target_path) and not is_transferit_folder:
+                zip_hosts = {"gofile", "buzzheavier", "pixeldrain", "filemirage"}
+                if self.up_dest in zip_hosts:
+                    source_folder = os.path.abspath(target_path)
+                    folder_name = os.path.basename(os.path.normpath(source_folder))
+                    try:
+                        archive_temp_dir = tempfile.mkdtemp(
+                            prefix="mltb_custom_upload_", dir=self.dir
+                        )
+                        archive_base = os.path.join(archive_temp_dir, folder_name)
+                        ui_msg = await send_message(
+                            self.message,
+                            f"📦 **Mengemas folder menjadi ZIP**\n"
+                            f"📁 `{folder_name}`\n"
+                            f"Harap tunggu...",
+                        )
+                        await asyncio.to_thread(
+                            shutil.make_archive,
+                            archive_base,
+                            "zip",
+                            os.path.dirname(source_folder),
+                            folder_name,
+                        )
+                        target_path = f"{archive_base}.zip"
+                        self.name = os.path.basename(target_path)
+                        await ui_msg.edit_text(
+                            f"✅ ZIP selesai.\n"
+                            f"⬆️ Memulai upload ke **{self.up_dest.upper()}**...\n"
+                            f"📁 `{self.name}`"
+                        )
+                    except Exception as e:
+                        if archive_temp_dir:
+                            shutil.rmtree(archive_temp_dir, ignore_errors=True)
+                            archive_temp_dir = None
+                        error_text = f"❌ Auto-ZIP gagal untuk `{folder_name}`: {e}"
+                        try:
+                            await ui_msg.edit_text(error_text)
+                        except Exception:
+                            await send_message(self.message, error_text)
+                        target_path = ""
+                else:
+                    await send_message(
+                        self.message,
+                        f"❌ Host **{self.up_dest.upper()}** belum mendukung folder "
+                        "pada Custom Upload ini. Gunakan Transfer.it atau file tunggal.",
+                    )
+                    target_path = ""
+
+            is_transferit_folder = (
+                bool(target_path)
+                and self.up_dest == "transferit"
+                and os.path.isdir(target_path)
+            )
+
+            if target_path and (
+                os.path.isfile(target_path) or is_transferit_folder
+            ):
+                if "ui_msg" not in locals() or ui_msg is None:
+                    ui_msg = await send_message(
+                        self.message,
+                        f"⬆️ Memulai Upload ke **{self.up_dest.upper()}**...\n"
+                        f"📁 `{self.name}`\nMenyiapkan koneksi...",
+                    )
+
+                total_size = await get_path_size(target_path)
+                shared_prog = {
+                    "uploaded": 0,
+                    "total": total_size,
+                    "done": False,
+                    "link": None,
+                    "error": None,
+                }
+
                 def sync_upload():
                     try:
-                        filename = os.path.basename(target_path)
-                        file_size = shared_prog['total']
-                        
+                        filename = os.path.basename(os.path.normpath(target_path))
+                        file_size = shared_prog["total"]
+
                         class ProgressTracker:
                             def __init__(self, filepath):
-                                self.f = open(filepath, 'rb')
+                                self.f = open(filepath, "rb")
+
                             def read(self, size=-1):
                                 chunk = self.f.read(size)
-                                shared_prog['uploaded'] += len(chunk)
+                                shared_prog["uploaded"] += len(chunk)
                                 return chunk
-                            def seek(self, offset, whence=0): return self.f.seek(offset, whence)
-                            def tell(self): return self.f.tell()
-                            def close(self): self.f.close()
 
-                        # 1. GOFILE
+                            def seek(self, offset, whence=0):
+                                return self.f.seek(offset, whence)
+
+                            def tell(self):
+                                return self.f.tell()
+
+                            def close(self):
+                                self.f.close()
+
+                        # 1. GOFILE (single file or ZIP generated above)
                         if self.up_dest == "gofile":
-                            server = requests.get("https://api.gofile.io/servers").json()['data']['servers'][0]['name']
+                            server = requests.get(
+                                "https://api.gofile.io/servers", timeout=30
+                            ).json()["data"]["servers"][0]["name"]
                             url = f"https://{server}.gofile.io/contents/uploadfile"
-                            
                             tr = ProgressTracker(target_path)
-                            data = {'token': api_key} if api_key else {}
-                            r = requests.post(url, files={'file': (filename, tr)}, data=data)
-                            tr.close()
-                            
+                            data = {"token": api_key} if api_key else {}
+                            try:
+                                r = requests.post(
+                                    url, files={"file": (filename, tr)},
+                                    data=data, timeout=600
+                                )
+                            finally:
+                                tr.close()
                             try:
                                 res = r.json()
-                                if res.get('status') == 'ok': 
-                                    shared_prog['link'] = res['data']['downloadPage']
-                                else: 
-                                    shared_prog['error'] = f"Gofile Error: {res}"
+                                if res.get("status") == "ok":
+                                    shared_prog["link"] = res["data"]["downloadPage"]
+                                else:
+                                    shared_prog["error"] = f"Gofile Error: {res}"
                             except Exception:
-                                shared_prog['error'] = f"Server GoFile Sedang Down/Penuh (HTTP {r.status_code}). Silakan coba host lain."
-                        
+                                shared_prog["error"] = (
+                                    f"Server GoFile bermasalah (HTTP {r.status_code})."
+                                )
+
                         # 2. BUZZHEAVIER
                         elif self.up_dest == "buzzheavier":
                             fname = urllib.parse.quote(filename, safe="")
                             url = f"https://w.buzzheavier.com/{fname}"
-                            
                             headers = {"Content-Length": str(file_size)}
-                            if api_key: headers["Authorization"] = f"Bearer {api_key}"
-                            
+                            if api_key:
+                                headers["Authorization"] = f"Bearer {api_key}"
                             tr = ProgressTracker(target_path)
-                            r = requests.put(url, data=tr, headers=headers)
-                            tr.close()
-                            
-                            res = r.json()
-                            url_res = res.get("data", {}).get("url")
-                            if not url_res and res.get("data", {}).get("id"): url_res = f"https://buzzheavier.com/{res['data']['id']}"
-                            if url_res: shared_prog['link'] = url_res
-                            else: shared_prog['error'] = f"Buzzheavier Error: {res}"
+                            try:
+                                r = requests.put(
+                                    url, data=tr, headers=headers, timeout=600
+                                )
+                            finally:
+                                tr.close()
+                            try:
+                                res = r.json()
+                                url_res = res.get("data", {}).get("url")
+                                if not url_res and res.get("data", {}).get("id"):
+                                    url_res = f"https://buzzheavier.com/{res['data']['id']}"
+                                if url_res:
+                                    shared_prog["link"] = url_res
+                                else:
+                                    shared_prog["error"] = f"Buzzheavier Error: {res}"
+                            except Exception as e:
+                                shared_prog["error"] = f"Buzzheavier response error: {e}"
 
                         # 3. PIXELDRAIN
                         elif self.up_dest == "pixeldrain":
                             auth = ("", api_key) if api_key else None
                             tr = ProgressTracker(target_path)
-                            r = requests.post("https://pixeldrain.com/api/file", files={'file': (filename, tr)}, auth=auth)
-                            tr.close()
-                            
+                            try:
+                                r = requests.post(
+                                    "https://pixeldrain.com/api/file",
+                                    files={"file": (filename, tr)}, auth=auth,
+                                    timeout=600
+                                )
+                            finally:
+                                tr.close()
                             try:
                                 rj = r.json()
-                                if rj.get("id"): shared_prog['link'] = f"https://pixeldrain.com/u/{rj['id']}"
-                                else: shared_prog['error'] = f"Pixeldrain Error: {rj}"
-                            except: shared_prog['error'] = f"Pixeldrain HTTP {r.status_code}"
+                                if rj.get("id"):
+                                    shared_prog["link"] = f"https://pixeldrain.com/u/{rj['id']}"
+                                else:
+                                    shared_prog["error"] = f"Pixeldrain Error: {rj}"
+                            except Exception:
+                                shared_prog["error"] = f"Pixeldrain HTTP {r.status_code}"
 
                         # 4. FILEMIRAGE
                         elif self.up_dest == "filemirage":
                             fm_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-                            srv_r = requests.get("https://filemirage.com/api/servers", headers=fm_headers).json()
-                            server = srv_r["data"]["server"].rstrip("/")
-                            upload_id = srv_r["data"]["upload_id"]
-                            
-                            CHUNK_SIZE = 100 * 1024 * 1024
-                            total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
-                            
+                            srv_r = requests.get(
+                                "https://filemirage.com/api/servers",
+                                headers=fm_headers, timeout=30
+                            )
+                            srv_r.raise_for_status()
+                            srv_j = srv_r.json()
+                            server = srv_j["data"]["server"].rstrip("/")
+                            upload_id = srv_j["data"]["upload_id"]
+                            chunk_size = 100 * 1024 * 1024
+                            total_chunks = max(1, math.ceil(file_size / chunk_size))
                             last_rj = {}
                             with open(target_path, "rb") as fh:
                                 for i in range(total_chunks):
-                                    chunk_data = fh.read(CHUNK_SIZE)
-                                    up_r = requests.post(f"{server}/upload.php", headers=fm_headers, 
-                                                         files={"file": (filename, chunk_data, "application/octet-stream")}, 
-                                                         data={"filename": filename, "upload_id": upload_id, "chunk_number": str(i), "total_chunks": str(total_chunks)})
-                                    shared_prog['uploaded'] += len(chunk_data)
-                                    if i == total_chunks - 1: last_rj = up_r.json()
-                            
+                                    chunk_data = fh.read(chunk_size)
+                                    up_r = requests.post(
+                                        f"{server}/upload.php",
+                                        headers=fm_headers,
+                                        files={"file": (filename, chunk_data, "application/octet-stream")},
+                                        data={
+                                            "filename": filename,
+                                            "upload_id": upload_id,
+                                            "chunk_number": str(i),
+                                            "total_chunks": str(total_chunks),
+                                        },
+                                        timeout=600,
+                                    )
+                                    up_r.raise_for_status()
+                                    shared_prog["uploaded"] += len(chunk_data)
+                                    if i == total_chunks - 1:
+                                        last_rj = up_r.json()
                             url = last_rj.get("data", {}).get("url")
-                            if url: shared_prog['link'] = url
-                            else: shared_prog['error'] = f"Filemirage Error: {last_rj}"
+                            if url:
+                                shared_prog["link"] = url
+                            else:
+                                shared_prog["error"] = f"Filemirage Error: {last_rj}"
 
-                        # 5. PLAYER4ME
+                        # 5. PLAYER4ME (video files only)
                         elif self.up_dest == "player4me":
                             if not api_key:
-                                shared_prog['error'] = "Player4me membutuhkan API Key (/setplayer4me)"
+                                shared_prog["error"] = "Player4me membutuhkan API Key (/setplayer4me)"
                                 return
                             p4_head = {"api-token": api_key, "Accept": "application/json"}
-                            ep_j = requests.get("https://player4me.com/api/v1/video/upload", headers=p4_head).json()
-                            tus_url, access_token = ep_j.get("tusUrl", "").rstrip("/") + "/", ep_j.get("accessToken", "")
-                            
-                            metadata = f"accessToken {base64.b64encode(access_token.encode()).decode()},filename {base64.b64encode(filename.encode()).decode()},filetype {base64.b64encode('video/mp4'.encode()).decode()}"
-                            create_r = requests.post(tus_url, headers={"Tus-Resumable": "1.0.0", "Upload-Length": str(file_size), "Upload-Metadata": metadata, "Content-Length": "0", "api-token": api_key})
-                            
+                            ep_j = requests.get(
+                                "https://player4me.com/api/v1/video/upload",
+                                headers=p4_head, timeout=60
+                            ).json()
+                            tus_url = ep_j.get("tusUrl", "").rstrip("/") + "/"
+                            access_token = ep_j.get("accessToken", "")
+                            metadata = (
+                                f"accessToken {base64.b64encode(access_token.encode()).decode()},"
+                                f"filename {base64.b64encode(filename.encode()).decode()},"
+                                f"filetype {base64.b64encode('video/mp4'.encode()).decode()}"
+                            )
+                            create_r = requests.post(
+                                tus_url,
+                                headers={
+                                    "Tus-Resumable": "1.0.0",
+                                    "Upload-Length": str(file_size),
+                                    "Upload-Metadata": metadata,
+                                    "Content-Length": "0",
+                                    "api-token": api_key,
+                                },
+                                timeout=60,
+                            )
+                            create_r.raise_for_status()
                             upload_url = create_r.headers.get("Location", "")
+                            if not upload_url:
+                                raise RuntimeError("Player4me tidak mengembalikan upload URL")
                             offset = 0
                             with open(target_path, "rb") as fh:
                                 while offset < file_size:
-                                    chunk = fh.read(52428800)
-                                    requests.patch(upload_url, data=chunk, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": str(offset), "Content-Type": "application/offset+octet-stream", "Content-Length": str(len(chunk)), "api-token": api_key})
+                                    chunk = fh.read(50 * 1024 * 1024)
+                                    response = requests.patch(
+                                        upload_url,
+                                        data=chunk,
+                                        headers={
+                                            "Tus-Resumable": "1.0.0",
+                                            "Upload-Offset": str(offset),
+                                            "Content-Type": "application/offset+octet-stream",
+                                            "Content-Length": str(len(chunk)),
+                                            "api-token": api_key,
+                                        },
+                                        timeout=600,
+                                    )
+                                    response.raise_for_status()
                                     offset += len(chunk)
-                                    shared_prog['uploaded'] = offset
-                                    
+                                    shared_prog["uploaded"] = offset
                             vid_id = upload_url.rstrip("/").split("/")[-1]
-                            shared_prog['link'] = f"https://player4me.com/video/{vid_id}"
+                            shared_prog["link"] = f"https://player4me.com/video/{vid_id}"
 
-                        # 6. TRANSFER.IT
+                        # 6. TRANSFER.IT: supports direct folder upload too
                         elif self.up_dest == "transferit":
                             try:
                                 from transferit import Transferit
                                 with Transferit() as tx:
                                     res = tx.upload(target_path)
-                                    shared_prog['link'] = res.url
-                                    shared_prog['uploaded'] = file_size # Set full ke 100% saat selesai
+                                    shared_prog["link"] = res.url
+                                    shared_prog["uploaded"] = file_size
                             except ImportError:
-                                shared_prog['error'] = "Library transferit-py belum terinstall. Pastikan sudah direbuild."
+                                shared_prog["error"] = (
+                                    "Library transferit-py belum terinstall. "
+                                    "Pastikan requirements sudah terpasang dan image direbuild."
+                                )
                             except Exception as e:
-                                shared_prog['error'] = f"Transfer.it Error: {str(e)}"
-
+                                shared_prog["error"] = f"Transfer.it Error: {e}"
                     except Exception as e:
-                        shared_prog['error'] = str(e)
+                        shared_prog["error"] = str(e)
                     finally:
-                        shared_prog['done'] = True
+                        shared_prog["done"] = True
 
                 async def progress_updater():
                     last_text = ""
                     start_time = time.time()
-                    while not shared_prog['done']:
+                    while not shared_prog["done"]:
                         await asyncio.sleep(3)
-                        if shared_prog['done']: break
-                        
-                        uploaded = shared_prog['uploaded']
-                        total = shared_prog['total']
+                        if shared_prog["done"]:
+                            break
+                        uploaded = shared_prog["uploaded"]
+                        total = shared_prog["total"]
                         percent = (uploaded / total) * 100 if total > 0 else 0
                         elapsed = time.time() - start_time
                         speed = uploaded / elapsed if elapsed > 0 else 0
-                        
                         bar_length = 15
-                        filled = int(bar_length * percent / 100)
+                        filled = max(0, min(bar_length, int(bar_length * percent / 100)))
                         bar = "█" * filled + "▒" * (bar_length - filled)
-                        
-                        # Info khusus jika ini Transfer.it agar user tahu sedang enkripsi
                         if self.up_dest == "transferit":
-                            text = (f"⬆️ **Mengupload ke TRANSFER.IT**\n"
-                                    f"📁 `{self.name}`\n"
-                                    f"⚡ Sedang memproses enkripsi & upload paralel...\n"
-                                    f"(Harap tunggu hingga link muncul)")
+                            text = (
+                                f"⬆️ **Mengupload ke TRANSFER.IT**\n"
+                                f"📁 `{self.name}`\n"
+                                f"⚡ Sedang memproses enkripsi dan upload...\n"
+                                f"(Harap tunggu hingga link muncul)"
+                            )
                         else:
-                            text = (f"⬆️ **Mengupload ke {self.up_dest.upper()}**\n"
-                                    f"📁 `{self.name}`\n"
-                                    f"[{bar}] {percent:.1f}%\n"
-                                    f"**Processed:** {get_readable_file_size(uploaded)} / {get_readable_file_size(total)}\n"
-                                    f"**Speed:** {get_readable_file_size(speed)}/s")
-                                
+                            text = (
+                                f"⬆️ **Mengupload ke {self.up_dest.upper()}**\n"
+                                f"📁 `{self.name}`\n"
+                                f"[{bar}] {percent:.1f}%\n"
+                                f"**Processed:** {get_readable_file_size(uploaded)} / "
+                                f"{get_readable_file_size(total)}\n"
+                                f"**Speed:** {get_readable_file_size(speed)}/s"
+                            )
                         if text != last_text:
                             try:
                                 await ui_msg.edit_text(text)
@@ -508,24 +674,42 @@ class TaskListener(TaskConfig):
                                 pass
 
                 updater_task = asyncio.create_task(progress_updater())
-                await asyncio.to_thread(sync_upload)
-                await updater_task
-                
-                if shared_prog['link']:
-                    pesan = f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\n🔗 **Link:** {shared_prog['link']}"
+                try:
+                    await asyncio.to_thread(sync_upload)
+                finally:
+                    await updater_task
+
+                if shared_prog["link"]:
+                    pesan = (
+                        f"✅ **Berhasil Upload ke {self.up_dest.upper()}**\n\n"
+                        f"📁 `{self.name}`\n🔗 **Link:** {shared_prog['link']}"
+                    )
                 else:
-                    pesan = f"❌ **Gagal Upload ke {self.up_dest.upper()}**\n\n📁 `{self.name}`\nError: {shared_prog['error']}"
-                    
+                    pesan = (
+                        f"❌ **Gagal Upload ke {self.up_dest.upper()}**\n\n"
+                        f"📁 `{self.name}`\nError: {shared_prog['error']}"
+                    )
+
                 try:
                     await ui_msg.edit_text(pesan)
-                except:
+                except Exception:
                     await send_message(self.message, pesan)
-            else:
-                await send_message(self.message, f"❌ **Gagal:** `{self.name}` adalah Folder. Script Custom ini hanya untuk Single File.")
-            
+
+                # Only remove temporary ZIP data; keep the original torrent folder
+                # untouched here. Normal task cleanup continues below.
+                if archive_temp_dir:
+                    shutil.rmtree(archive_temp_dir, ignore_errors=True)
+            elif target_path:
+                await send_message(
+                    self.message,
+                    f"❌ **Gagal:** `{self.name}` adalah Folder atau file tidak ditemukan. "
+                    f"Transfer.it bisa menerima folder langsung; host lain pada Custom Upload ini "
+                    f"membutuhkan satu file atau ZIP.",
+                )
+
         # ==========================================
-        
-        elif is_gdrive_id(self.up_dest) or getattr(self, 'up_dest', '') == "gd":
+
+        elif is_gdrive_id(self.up_dest) or getattr(self, "up_dest", "") == "gd":
             LOGGER.info(f"Gdrive Upload Name: {self.name}")
             drive = GoogleDriveUpload(self, up_path)
             async with task_dict_lock:
@@ -553,7 +737,7 @@ class TaskListener(TaskConfig):
                     non_queued_up.remove(self.mid)
             await start_from_queued()
             return
-            
+
         await clean_download(self.dir)
         async with task_dict_lock:
             if self.mid in task_dict:
