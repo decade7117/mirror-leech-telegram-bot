@@ -5,6 +5,7 @@
  - /gofile, /pixeldrain, /buzzheavier, /filemirage, /player4me, /akirabox
  - /transferit     → download video dari URL dan upload ke transfer.it (API E2EE Murni - Anonim & Akun)
  - Tombol Inline Cancel terintegrasi di semua proses
+ - Auto-Zip untuk deteksi folder sebelum upload
 ============================================================
 """
 
@@ -15,6 +16,7 @@ import urllib.parse
 from asyncio import to_thread
 import asyncio
 import time
+import shutil
 
 from pyrogram.filters import command
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
@@ -514,15 +516,33 @@ async def multi_mirror_cmd(_, message):
             return
         need_del = True
     elif is_abs:
-        dest = arg
-        if not os.path.exists(dest):
-            await status_msg.edit(f"❌ File tidak ada: {dest}")
+        if os.path.isdir(arg):
+            await status_msg.edit(f"📦 Folder terdeteksi, sedang meng-zip...\n<code>{arg}</code>", reply_markup=cancel_btn)
+            zip_path = os.path.join(TEMP_DIR, f"{os.path.basename(arg)}.zip")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            await to_thread(shutil.make_archive, zip_path.replace(".zip", ""), "zip", os.path.dirname(arg), os.path.basename(arg))
+            dest = zip_path
+            need_del = True
+        elif os.path.exists(arg):
+            dest = arg
+        else:
+            await status_msg.edit(f"❌ File tidak ada: {arg}")
             return
     else:
         dest = await to_thread(_find_file_in_downloads, arg)
         if not dest:
-            await status_msg.edit(f"❌ File <code>{arg}</code> tidak ditemukan di downloads.")
-            return
+            # Cek apakah ini folder
+            folder_path = os.path.join(DOWNLOAD_DIR, arg)
+            if os.path.isdir(folder_path):
+                await status_msg.edit(f"📦 Folder terdeteksi, sedang meng-zip...\n<code>{arg}</code>", reply_markup=cancel_btn)
+                zip_path = os.path.join(TEMP_DIR, f"{arg}.zip")
+                os.makedirs(TEMP_DIR, exist_ok=True)
+                await to_thread(shutil.make_archive, zip_path.replace(".zip", ""), "zip", DOWNLOAD_DIR, arg)
+                dest = zip_path
+                need_del = True
+            else:
+                await status_msg.edit(f"❌ File <code>{arg}</code> tidak ditemukan di downloads.")
+                return
 
     size_str = _sizeof_fmt(os.path.getsize(dest))
     key = _API_KEYS.get(host, "")
@@ -533,7 +553,11 @@ async def multi_mirror_cmd(_, message):
         link = await to_thread(func, dest, key, user_id)
 
     if need_del:
-        try: os.remove(dest)
+        try:
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            elif os.path.exists(dest):
+                os.remove(dest)
         except: pass
 
     if link and link.startswith("http"):
